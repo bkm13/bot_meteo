@@ -37,6 +37,7 @@ EXCEL_PATH = BASE_DIR / "registro_meteo.xlsx"
 CSV_DIARIO_PATH = BASE_DIR / "registro_diario.csv"
 CSV_RECORDS_PATH = BASE_DIR / "records.csv"
 RECORDS_PATH = BASE_DIR / "records.json"
+SNAPSHOT_PATH = BASE_DIR / "snapshot_2100.json"
 LOG_PATH = BASE_DIR / "bot_meteo.log"
 
 WU_API_KEY = os.environ.get("WU_API_KEY", "")
@@ -318,8 +319,62 @@ def subir_a_github(hoy):
 
 
 # ---------------------------------------------------------------------------
-# Telegram
+# Snapshot de las 21:00 y novedades nocturnas
 # ---------------------------------------------------------------------------
+def guardar_snapshot(resumen, hoy):
+    """Guarda la foto de lluvia/viento en el momento del resumen de las 21:00."""
+    datos = {
+        "fecha": hoy.isoformat(),
+        "lluvia": resumen["lluvia"],
+        "racha_max": resumen["racha_max"],
+    }
+    try:
+        SNAPSHOT_PATH.write_text(
+            json.dumps(datos, ensure_ascii=False), encoding="utf-8"
+        )
+        log.info("Snapshot 21:00 guardado: %s", datos)
+    except Exception as e:
+        log.warning("No se pudo guardar el snapshot: %s", e)
+
+
+def novedades_desde_snapshot(resumen, hoy):
+    """Compara el día completo con la foto de las 21:00.
+    Devuelve lista de líneas si llovió más o el viento superó la racha."""
+    if not SNAPSHOT_PATH.exists():
+        return []
+    try:
+        snap = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("snapshot_2100.json ilegible: %s", e)
+        return []
+    if snap.get("fecha") != hoy.isoformat():
+        log.info("Snapshot de otro día (%s), se ignora", snap.get("fecha"))
+        return []
+
+    lineas = []
+
+    lluvia_2100 = snap.get("lluvia") or 0.0
+    lluvia_final = resumen["lluvia"] or 0.0
+    if lluvia_final > lluvia_2100 + 0.01:
+        delta = lluvia_final - lluvia_2100
+        lineas.append(
+            f"🌧 Lluvia: <b>{lluvia_final:.1f} mm</b> en el día "
+            f"(+{delta:.1f} mm desde las 21:00)"
+        )
+
+    racha_2100 = snap.get("racha_max")
+    racha_final = resumen["racha_max"]
+    if racha_final is not None and (racha_2100 is None or racha_final > racha_2100 + 0.01):
+        hora_txt = f" a las {resumen['hora_racha']}" if resumen["hora_racha"] else ""
+        ant_txt = f" (a las 21:00 era {racha_2100:.1f} km/h)" if racha_2100 is not None else ""
+        lineas.append(
+            f"💨 Racha máx: <b>{racha_final:.1f} km/h</b>{hora_txt}{ant_txt}"
+        )
+
+    return lineas
+
+
+
 def _fmt(valor, unidad=""):
     return f"{valor:.1f}{unidad}" if valor is not None else "n/d"
 
@@ -353,9 +408,14 @@ def construir_mensaje(resumen, batidos, hoy):
     return "\n".join(lineas)
 
 
-def enviar_telegram(texto):
+def enviar_telegram(texto, silencioso=False):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": texto, "parse_mode": "HTML"}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": texto,
+        "parse_mode": "HTML",
+        "disable_notification": silencioso,
+    }
     for intento in range(3):
         try:
             r = requests.post(url, json=payload, timeout=30)
@@ -381,23 +441,63 @@ def main():
         log.error("Faltan variables de entorno: %s", ", ".join(faltan))
         sys.exit(1)
 
+    # Modo de ejecución: "resumen" (21:00, solo mensaje) o "registro" (23:57, silencioso)
+    modo = sys.argv[1] if len(sys.argv) > 1 else "resumen"
+    if modo not in ("resumen", "registro"):
+        log.error("Modo desconocido: %s (usa 'resumen' o 'registro')", modo)
+        sys.exit(1)
+
     hoy = date.today()
-    log.info("=== Ejecución diaria %s ===", hoy.isoformat())
+    log.info("=== Ejecución diaria %s (modo: %s) ===", hoy.isoformat(), modo)
 
     observaciones = descargar_observaciones()
     if not observaciones:
         enviar_telegram(
             f"⚠️ <b>Bot Meteo</b>: no se pudieron obtener datos de la estación "
-            f"{WU_STATION_ID} para el {hoy.strftime('%d/%m/%Y')}."
+            f"{WU_STATION_ID} para el {hoy.strftime('%d/%m/%Y')}.",
+            silencioso=(modo == "registro"),
         )
         sys.exit(1)
 
     resumen = calcular_resumen(observaciones)
-    batidos = comprobar_records(resumen, hoy)
-    registrar_en_excel(resumen, batidos, hoy)
-    enviar_telegram(construir_mensaje(resumen, batidos, hoy))
-    subir_a_github(hoy)
-    log.info("=== Fin de la ejecución ===")
+
+    if modo == "resumen":
+        # 21:00 — mensaje informativo + foto de lluvia/viento para comparar luego
+        enviar_telegram(construir_mensaje(resumen, [], hoy))
+        guardar_snapshot(resumen, hoy)
+    else:
+        # 23:57 — registro definitivo del día completo, sin despertar a nadie
+        batidos = comprobar_records(resumen, hoy)
+        registrar_en_excel(resumen, batidos, hoy)
+
+        bloques = []
+
+        novedades = novedades_desde_snapshot(resumen, hoy)
+        if novedades:
+            bloques.append(
+                "\n".join([f"🌙 <b>Novedades desde las 21:00 — {hoy.strftime('%d/%m/%Y')}</b>"]
+                          + novedades)
+            )
+
+        if batidos:
+            lineas = [f"🏆 <b>Récord batido el {hoy.strftime('%d/%m/%Y')}</b>"]
+            for b in batidos:
+                hora_txt = f" a las {b['hora']}" if b["hora"] else ""
+                ant = b["anterior"]
+                ant_txt = (
+                    f" (anterior: {ant['valor']} {b['unidad']}, {ant['fecha']})" if ant else ""
+                )
+                lineas.append(
+                    f"• {b['etiqueta']}: <b>{b['valor']} {b['unidad']}</b>{hora_txt}{ant_txt}"
+                )
+            bloques.append("\n".join(lineas))
+
+        if bloques:
+            enviar_telegram("\n\n".join(bloques), silencioso=True)
+
+        subir_a_github(hoy)
+
+    log.info("=== Fin de la ejecución (modo: %s) ===", modo)
 
 
 if __name__ == "__main__":
