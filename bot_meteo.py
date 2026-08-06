@@ -35,10 +35,10 @@ EXCEL_PATH = BASE_DIR / "registro_meteo.xlsx"
 RECORDS_PATH = BASE_DIR / "records.json"
 LOG_PATH = BASE_DIR / "bot_meteo.log"
 
-WU_API_KEY = os.environ.get("WU_API_KEY", "")
-WU_STATION_ID = os.environ.get("WU_STATION_ID", "")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+WU_API_KEY = os.environ.get("532aea9c11f14d11aaea9c11f12d11c4", "")
+WU_STATION_ID = os.environ.get("IMONTE1305", "")
+TELEGRAM_TOKEN = os.environ.get("8600853013:AAFpFVZ2mz6Ku8IqMbSNUEL5EV1HstOPbnk", "")
+TELEGRAM_CHAT_ID = os.environ.get("8986639509", "")
 
 WU_URL = (
     "https://api.weather.com/v2/pws/observations/all/1day"
