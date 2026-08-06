@@ -1,0 +1,9 @@
+[Unit]
+Description=Ejecuta el registro definitivo de Bot Meteo a las 23:57 (hora de Madrid)
+
+[Timer]
+OnCalendar=*-*-* 23:57:00 Europe/Madrid
+Persistent=true
+
+[Install]
+WantedBy=timers.target
