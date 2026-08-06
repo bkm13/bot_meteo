@@ -1,0 +1,27 @@
+{
+  "temp_max": {
+    "valor": 34.5,
+    "fecha": "2026-08-06",
+    "hora": "12:29"
+  },
+  "temp_min": {
+    "valor": 21.9,
+    "fecha": "2026-08-06",
+    "hora": "07:59"
+  },
+  "racha_max": {
+    "valor": 19.8,
+    "fecha": "2026-08-06",
+    "hora": "11:59"
+  },
+  "presion_max": {
+    "valor": 1019.98,
+    "fecha": "2026-08-06",
+    "hora": ""
+  },
+  "presion_min": {
+    "valor": 1017.95,
+    "fecha": "2026-08-06",
+    "hora": ""
+  }
+}
