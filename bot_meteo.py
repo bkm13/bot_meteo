@@ -2,13 +2,10 @@
 """
 Bot Meteo - Resumen diario de estación meteorológica (Weather Underground)
 ==========================================================================
-Se ejecuta una vez al día (systemd timer, 21:00 Europe/Madrid):
-  1. Descarga todas las observaciones del día desde la API PWS de WU
-  2. Calcula máximos/mínimos con hora exacta
-  3. Envía resumen por Telegram
-  4. Registra el día en registro_meteo.xlsx (hoja "Diario")
-  5. Comprueba récords históricos (records.json); si se bate alguno,
-     lo anuncia y lo guarda en la hoja "Récords" del Excel
+Modos de ejecución (systemd timers):
+  resumen   21:00  - Mensaje informativo del día + snapshot de lluvia/viento
+  registro  23:57  - Registro definitivo del día (Excel, récords, GitHub), silencioso
+  mensual   día 1  - Medias del mes anterior en medias_mensuales.xlsx + GitHub
 
 Variables de entorno necesarias (/etc/bot-meteo.env):
   WU_API_KEY        - API key de Weather Underground
@@ -23,7 +20,7 @@ import csv
 import json
 import logging
 import subprocess
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import requests
@@ -36,6 +33,8 @@ BASE_DIR = Path(__file__).resolve().parent
 EXCEL_PATH = BASE_DIR / "registro_meteo.xlsx"
 CSV_DIARIO_PATH = BASE_DIR / "registro_diario.csv"
 CSV_RECORDS_PATH = BASE_DIR / "records.csv"
+MEDIAS_XLSX_PATH = BASE_DIR / "medias_mensuales.xlsx"
+MEDIAS_CSV_PATH = BASE_DIR / "medias_mensuales.csv"
 RECORDS_PATH = BASE_DIR / "records.json"
 SNAPSHOT_PATH = BASE_DIR / "snapshot_2100.json"
 LOG_PATH = BASE_DIR / "bot_meteo.log"
@@ -61,9 +60,21 @@ CABECERA_DIARIO = [
     "Fecha", "Temp Máx (°C)", "Hora Temp Máx", "Temp Mín (°C)", "Hora Temp Mín",
     "Racha Máx (km/h)", "Hora Racha", "Lluvia (mm)",
     "Presión Máx (hPa)", "Presión Mín (hPa)",
-    "Humedad Máx (%)", "Humedad Mín (%)", "Nº Observaciones",
+    "Humedad Máx (%)", "Humedad Mín (%)",
+    "Radiación Máx (W/m²)", "Hora Radiación", "UV Máx",
+    "Nº Observaciones",
 ]
 CABECERA_RECORDS = ["Tipo de récord", "Valor", "Fecha", "Hora", "Récord anterior", "Detalles"]
+CABECERA_MENSUAL = [
+    "Mes", "Días con datos",
+    "Media Máximas (°C)", "Media Mínimas (°C)", "Temp Media (°C)",
+    "Máx absoluta (°C)", "Fecha Máx", "Mín absoluta (°C)", "Fecha Mín",
+    "Media Rachas (km/h)", "Racha Máx (km/h)", "Fecha Racha",
+    "Lluvia Total (mm)", "Días de lluvia",
+    "Media Presión (hPa)",
+    "Media Humedad Máx (%)", "Media Humedad Mín (%)",
+    "Media Radiación Máx (W/m²)", "Media UV Máx",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +120,8 @@ def calcular_resumen(observaciones):
         "lluvia": 0.0,
         "presion_max": None, "presion_min": None,
         "humedad_max": None, "humedad_min": None,
+        "solar_max": None, "hora_solar": "",
+        "uv_max": None,
         "n_obs": len(observaciones),
     }
 
@@ -149,6 +162,16 @@ def calcular_resumen(observaciones):
         if h_lo is not None and (resumen["humedad_min"] is None or h_lo < resumen["humedad_min"]):
             resumen["humedad_min"] = h_lo
 
+        # Radiación solar y UV (van a nivel de observación, no en "metric")
+        sol = _flt(obs.get("solarRadiationHigh"))
+        if sol is not None and (resumen["solar_max"] is None or sol > resumen["solar_max"]):
+            resumen["solar_max"] = sol
+            resumen["hora_solar"] = _hora(obs)
+
+        uv = _flt(obs.get("uvHigh"))
+        if uv is not None and (resumen["uv_max"] is None or uv > resumen["uv_max"]):
+            resumen["uv_max"] = uv
+
         # precipTotal es acumulado del día: nos quedamos con el mayor visto
         lluvia = _flt(m.get("precipTotal"))
         if lluvia is not None and lluvia > resumen["lluvia"]:
@@ -168,6 +191,8 @@ DEFINICION_RECORDS = [
     ("lluvia", "lluvia_dia", "Lluvia en un día", "mm", True, None),
     ("presion_max", "presion_max", "Presión máxima", "hPa", True, None),
     ("presion_min", "presion_min", "Presión mínima", "hPa", False, None),
+    ("solar_max", "solar_max", "Radiación solar", "W/m²", True, "hora_solar"),
+    ("uv_max", "uv_max", "Índice UV", "", True, None),
 ]
 
 
@@ -220,8 +245,15 @@ def comprobar_records(resumen, hoy):
 
 
 # ---------------------------------------------------------------------------
-# Excel
+# Excel diario
 # ---------------------------------------------------------------------------
+def _sincronizar_cabecera(hoja, cabecera):
+    """Asegura que la fila 1 de la hoja coincide con la cabecera actual
+    (necesario al añadir columnas nuevas como radiación/UV)."""
+    for col, titulo in enumerate(cabecera, start=1):
+        hoja.cell(row=1, column=col, value=titulo)
+
+
 def abrir_excel():
     if EXCEL_PATH.exists():
         wb = load_workbook(EXCEL_PATH)
@@ -233,7 +265,9 @@ def abrir_excel():
         wb.create_sheet("Diario").append(CABECERA_DIARIO)
     if "Récords" not in wb.sheetnames:
         wb.create_sheet("Récords").append(CABECERA_RECORDS)
+    _sincronizar_cabecera(wb["Diario"], CABECERA_DIARIO)
     return wb
+
 
 def registrar_en_excel(resumen, batidos, hoy):
     wb = abrir_excel()
@@ -254,6 +288,7 @@ def registrar_en_excel(resumen, batidos, hoy):
         resumen["lluvia"],
         resumen["presion_max"], resumen["presion_min"],
         resumen["humedad_max"], resumen["humedad_min"],
+        resumen["solar_max"], resumen["hora_solar"], resumen["uv_max"],
         resumen["n_obs"],
     ])
 
@@ -265,7 +300,7 @@ def registrar_en_excel(resumen, batidos, hoy):
         )
         ws_rec.append([
             b["etiqueta"],
-            f"{b['valor']} {b['unidad']}",
+            f"{b['valor']} {b['unidad']}".strip(),
             fecha_str,
             b["hora"] or "—",
             ant_txt,
@@ -294,17 +329,216 @@ def exportar_csv(hoja, destino):
 
 
 # ---------------------------------------------------------------------------
+# Medias mensuales (modo "mensual", se ejecuta el día 1 de cada mes)
+# ---------------------------------------------------------------------------
+def _media(valores):
+    valores = [v for v in valores if v is not None]
+    return round(sum(valores) / len(valores), 1) if valores else None
+
+
+def leer_dias_del_mes(anio, mes):
+    """Lee la hoja Diario y devuelve los días del mes indicado como dicts."""
+    if not EXCEL_PATH.exists():
+        return []
+    wb = load_workbook(EXCEL_PATH, read_only=True, data_only=True)
+    if "Diario" not in wb.sheetnames:
+        return []
+    ws = wb["Diario"]
+
+    filas = ws.iter_rows(values_only=True)
+    cabecera = next(filas, None)
+    if not cabecera:
+        return []
+    idx = {str(nombre): i for i, nombre in enumerate(cabecera) if nombre}
+
+    def celda(fila, nombre):
+        i = idx.get(nombre)
+        if i is None or i >= len(fila):
+            return None
+        return fila[i]
+
+    dias = []
+    for fila in filas:
+        fecha_raw = celda(fila, "Fecha")
+        if not fecha_raw:
+            continue
+        try:
+            f = datetime.strptime(str(fecha_raw).strip(), "%d/%m/%Y").date()
+        except ValueError:
+            continue
+        if f.year != anio or f.month != mes:
+            continue
+        dias.append({
+            "fecha": f,
+            "temp_max": _flt(celda(fila, "Temp Máx (°C)")),
+            "temp_min": _flt(celda(fila, "Temp Mín (°C)")),
+            "racha": _flt(celda(fila, "Racha Máx (km/h)")),
+            "lluvia": _flt(celda(fila, "Lluvia (mm)")),
+            "presion_max": _flt(celda(fila, "Presión Máx (hPa)")),
+            "presion_min": _flt(celda(fila, "Presión Mín (hPa)")),
+            "hum_max": _flt(celda(fila, "Humedad Máx (%)")),
+            "hum_min": _flt(celda(fila, "Humedad Mín (%)")),
+            "solar": _flt(celda(fila, "Radiación Máx (W/m²)")),
+            "uv": _flt(celda(fila, "UV Máx")),
+        })
+    return dias
+
+
+def calcular_medias_mes(dias):
+    """A partir de la lista de días, calcula el resumen mensual."""
+    def maximo(clave):
+        candidatos = [(d[clave], d["fecha"]) for d in dias if d[clave] is not None]
+        return max(candidatos) if candidatos else (None, None)
+
+    def minimo(clave):
+        candidatos = [(d[clave], d["fecha"]) for d in dias if d[clave] is not None]
+        return min(candidatos) if candidatos else (None, None)
+
+    temp_medias = [
+        (d["temp_max"] + d["temp_min"]) / 2
+        for d in dias if d["temp_max"] is not None and d["temp_min"] is not None
+    ]
+    presion_medias = [
+        (d["presion_max"] + d["presion_min"]) / 2
+        for d in dias if d["presion_max"] is not None and d["presion_min"] is not None
+    ]
+
+    max_abs, fecha_max = maximo("temp_max")
+    min_abs, fecha_min = minimo("temp_min")
+    racha_abs, fecha_racha = maximo("racha")
+    lluvias = [d["lluvia"] for d in dias if d["lluvia"] is not None]
+
+    return {
+        "dias": len(dias),
+        "media_max": _media([d["temp_max"] for d in dias]),
+        "media_min": _media([d["temp_min"] for d in dias]),
+        "temp_media": _media(temp_medias),
+        "max_abs": max_abs, "fecha_max": fecha_max,
+        "min_abs": min_abs, "fecha_min": fecha_min,
+        "media_racha": _media([d["racha"] for d in dias]),
+        "racha_abs": racha_abs, "fecha_racha": fecha_racha,
+        "lluvia_total": round(sum(lluvias), 1) if lluvias else 0.0,
+        "dias_lluvia": sum(1 for v in lluvias if v > 0),
+        "media_presion": _media(presion_medias),
+        "media_hum_max": _media([d["hum_max"] for d in dias]),
+        "media_hum_min": _media([d["hum_min"] for d in dias]),
+        "media_solar": _media([d["solar"] for d in dias]),
+        "media_uv": _media([d["uv"] for d in dias]),
+    }
+
+
+def registrar_medias(stats, anio, mes):
+    """Escribe/actualiza la fila del mes en medias_mensuales.xlsx y su CSV."""
+    if MEDIAS_XLSX_PATH.exists():
+        wb = load_workbook(MEDIAS_XLSX_PATH)
+    else:
+        wb = Workbook()
+        wb.active.title = "Mensual"
+        wb["Mensual"].append(CABECERA_MENSUAL)
+    if "Mensual" not in wb.sheetnames:
+        wb.create_sheet("Mensual").append(CABECERA_MENSUAL)
+    ws = wb["Mensual"]
+    _sincronizar_cabecera(ws, CABECERA_MENSUAL)
+
+    mes_str = f"{mes:02d}/{anio}"
+    # Si el mes ya existe (re-ejecución), se sobrescribe su fila
+    for fila in range(ws.max_row, 1, -1):
+        if ws.cell(row=fila, column=1).value == mes_str:
+            log.info("El mes %s ya estaba registrado; se sobrescribe", mes_str)
+            ws.delete_rows(fila)
+
+    def fch(f):
+        return f.strftime("%d/%m/%Y") if f else "—"
+
+    ws.append([
+        mes_str, stats["dias"],
+        stats["media_max"], stats["media_min"], stats["temp_media"],
+        stats["max_abs"], fch(stats["fecha_max"]),
+        stats["min_abs"], fch(stats["fecha_min"]),
+        stats["media_racha"], stats["racha_abs"], fch(stats["fecha_racha"]),
+        stats["lluvia_total"], stats["dias_lluvia"],
+        stats["media_presion"],
+        stats["media_hum_max"], stats["media_hum_min"],
+        stats["media_solar"], stats["media_uv"],
+    ])
+
+    wb.save(MEDIAS_XLSX_PATH)
+    log.info("Excel mensual actualizado: %s", MEDIAS_XLSX_PATH)
+    exportar_csv(ws, MEDIAS_CSV_PATH)
+
+
+NOMBRES_MES = [
+    "", "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
+
+
+def construir_mensaje_mensual(stats, anio, mes):
+    nombre = NOMBRES_MES[mes].capitalize()
+    lineas = [
+        f"📊 <b>Resumen mensual — {nombre} {anio}</b>",
+        f"({stats['dias']} días con datos)",
+        "",
+        f"🌡 Media de máximas: <b>{_fmt(stats['media_max'], '°C')}</b>",
+        f"❄️ Media de mínimas: <b>{_fmt(stats['media_min'], '°C')}</b>",
+        f"🌡 Temperatura media: <b>{_fmt(stats['temp_media'], '°C')}</b>",
+        f"🔥 Máxima absoluta: <b>{_fmt(stats['max_abs'], '°C')}</b>"
+        + (f" ({stats['fecha_max'].strftime('%d/%m')})" if stats["fecha_max"] else ""),
+        f"🧊 Mínima absoluta: <b>{_fmt(stats['min_abs'], '°C')}</b>"
+        + (f" ({stats['fecha_min'].strftime('%d/%m')})" if stats["fecha_min"] else ""),
+        f"💨 Media de rachas: <b>{_fmt(stats['media_racha'], ' km/h')}</b>",
+        f"🌪 Racha máxima: <b>{_fmt(stats['racha_abs'], ' km/h')}</b>"
+        + (f" ({stats['fecha_racha'].strftime('%d/%m')})" if stats["fecha_racha"] else ""),
+        f"🌧 Lluvia total: <b>{stats['lluvia_total']:.1f} mm</b> "
+        f"({stats['dias_lluvia']} días de lluvia)",
+        f"🔵 Presión media: <b>{_fmt(stats['media_presion'], ' hPa')}</b>",
+        f"💧 Humedad media: {_fmt(stats['media_hum_min'], '%')} – {_fmt(stats['media_hum_max'], '%')}",
+    ]
+    if stats["media_solar"] is not None:
+        lineas.append(f"☀️ Media radiación máx: <b>{_fmt(stats['media_solar'], ' W/m²')}</b>")
+    if stats["media_uv"] is not None:
+        lineas.append(f"🕶 Media UV máx: <b>{_fmt(stats['media_uv'])}</b>")
+    return "\n".join(lineas)
+
+
+def ejecutar_mensual(hoy):
+    """Calcula y registra las medias del mes anterior."""
+    ultimo_dia_mes_anterior = hoy.replace(day=1) - timedelta(days=1)
+    anio, mes = ultimo_dia_mes_anterior.year, ultimo_dia_mes_anterior.month
+    log.info("Calculando medias de %02d/%d", mes, anio)
+
+    dias = leer_dias_del_mes(anio, mes)
+    if not dias:
+        log.warning("No hay días registrados para %02d/%d", mes, anio)
+        enviar_telegram(
+            f"⚠️ <b>Bot Meteo</b>: no hay datos registrados de "
+            f"{NOMBRES_MES[mes]} {anio}, no se pueden calcular medias.",
+        )
+        return
+
+    stats = calcular_medias_mes(dias)
+    registrar_medias(stats, anio, mes)
+    enviar_telegram(construir_mensaje_mensual(stats, anio, mes))
+    subir_a_github(hoy, f"Medias mensuales {mes:02d}/{anio}")
+
+
+# ---------------------------------------------------------------------------
 # Sincronización con GitHub
 # ---------------------------------------------------------------------------
-def subir_a_github(hoy):
+def subir_a_github(hoy, mensaje=None):
     """Commit y push de los ficheros de datos. Si falla, solo lo registra."""
-    archivos = ["registro_meteo.xlsx", "registro_diario.csv", "records.csv", "records.json"]
+    archivos = [
+        "registro_meteo.xlsx", "registro_diario.csv", "records.csv", "records.json",
+        "medias_mensuales.xlsx", "medias_mensuales.csv",
+    ]
+    existentes = [a for a in archivos if (BASE_DIR / a).exists()]
+    mensaje = mensaje or f"Registro diario {hoy.strftime('%d/%m/%Y')}"
     base = ["git", "-C", str(BASE_DIR),
             "-c", "user.name=bot-meteo", "-c", "user.email=bot-meteo@vm"]
     try:
-        subprocess.run(base + ["add"] + archivos, check=True, capture_output=True, timeout=60)
+        subprocess.run(base + ["add"] + existentes, check=True, capture_output=True, timeout=60)
         commit = subprocess.run(
-            base + ["commit", "-m", f"Registro diario {hoy.strftime('%d/%m/%Y')}"],
+            base + ["commit", "-m", mensaje],
             capture_output=True, text=True, timeout=60,
         )
         if commit.returncode != 0:
@@ -374,7 +608,6 @@ def novedades_desde_snapshot(resumen, hoy):
     return lineas
 
 
-
 def _fmt(valor, unidad=""):
     return f"{valor:.1f}{unidad}" if valor is not None else "n/d"
 
@@ -396,6 +629,11 @@ def construir_mensaje(resumen, batidos, hoy):
         lineas.append(
             f"💧 Humedad: {_fmt(resumen['humedad_min'], '%')} – {_fmt(resumen['humedad_max'], '%')}"
         )
+    if resumen["solar_max"] is not None:
+        hora_txt = f" ({resumen['hora_solar']})" if resumen["hora_solar"] else ""
+        lineas.append(f"☀️ Radiación máx: <b>{_fmt(resumen['solar_max'], ' W/m²')}</b>{hora_txt}")
+    if resumen["uv_max"] is not None:
+        lineas.append(f"🕶 UV máx: <b>{_fmt(resumen['uv_max'])}</b>")
 
     if batidos:
         lineas += ["", "🏆 <b>¡RÉCORD BATIDO!</b>"]
@@ -441,14 +679,20 @@ def main():
         log.error("Faltan variables de entorno: %s", ", ".join(faltan))
         sys.exit(1)
 
-    # Modo de ejecución: "resumen" (21:00, solo mensaje) o "registro" (23:57, silencioso)
+    # Modos: "resumen" (21:00), "registro" (23:57, silencioso), "mensual" (día 1)
     modo = sys.argv[1] if len(sys.argv) > 1 else "resumen"
-    if modo not in ("resumen", "registro"):
-        log.error("Modo desconocido: %s (usa 'resumen' o 'registro')", modo)
+    if modo not in ("resumen", "registro", "mensual"):
+        log.error("Modo desconocido: %s (usa 'resumen', 'registro' o 'mensual')", modo)
         sys.exit(1)
 
     hoy = date.today()
     log.info("=== Ejecución diaria %s (modo: %s) ===", hoy.isoformat(), modo)
+
+    if modo == "mensual":
+        # No necesita descargar nada: trabaja sobre el registro ya guardado
+        ejecutar_mensual(hoy)
+        log.info("=== Fin de la ejecución (modo: mensual) ===")
+        return
 
     observaciones = descargar_observaciones()
     if not observaciones:
