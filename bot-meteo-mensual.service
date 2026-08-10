@@ -1,0 +1,11 @@
+[Unit]
+Description=Bot Meteo - medias mensuales del mes anterior
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=davidbkm1994
+WorkingDirectory=/home/davidbkm1994/bot-meteo
+EnvironmentFile=/etc/bot-meteo.env
+ExecStart=/home/davidbkm1994/bot-meteo/venv/bin/python /home/davidbkm1994/bot-meteo/bot_meteo.py mensual

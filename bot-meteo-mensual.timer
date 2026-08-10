@@ -1,0 +1,9 @@
+[Unit]
+Description=Ejecuta las medias mensuales el dia 1 de cada mes a las 00:20 (hora de Madrid)
+
+[Timer]
+OnCalendar=*-*-01 00:20:00 Europe/Madrid
+Persistent=true
+
+[Install]
+WantedBy=timers.target

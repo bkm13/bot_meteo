@@ -1,0 +1,16 @@
+[Unit]
+Description=Bot Meteo - listener de comandos Telegram (/tiempo, /hoy, /records)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=davidbkm1994
+WorkingDirectory=/home/davidbkm1994/bot-meteo
+EnvironmentFile=/etc/bot-meteo.env
+ExecStart=/home/davidbkm1994/bot-meteo/venv/bin/python /home/davidbkm1994/bot-meteo/bot_meteo_listener.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
