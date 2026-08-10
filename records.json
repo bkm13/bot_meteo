@@ -5,9 +5,9 @@
     "hora": "14:44"
   },
   "temp_min": {
-    "valor": 21.9,
-    "fecha": "2026-08-06",
-    "hora": "07:59"
+    "valor": 20.8,
+    "fecha": "2026-08-10",
+    "hora": "08:29"
   },
   "racha_max": {
     "valor": 36.5,
@@ -22,6 +22,16 @@
   "presion_min": {
     "valor": 1014.22,
     "fecha": "2026-08-08",
+    "hora": ""
+  },
+  "solar_max": {
+    "valor": 816.2,
+    "fecha": "2026-08-10",
+    "hora": "14:24"
+  },
+  "uv_max": {
+    "valor": 10.0,
+    "fecha": "2026-08-10",
     "hora": ""
   }
 }
