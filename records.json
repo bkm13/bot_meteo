@@ -20,8 +20,8 @@
     "hora": ""
   },
   "presion_min": {
-    "valor": 1014.22,
-    "fecha": "2026-08-08",
+    "valor": 1013.55,
+    "fecha": "2026-08-14",
     "hora": ""
   },
   "solar_max": {
@@ -32,6 +32,11 @@
   "uv_max": {
     "valor": 10.0,
     "fecha": "2026-08-10",
+    "hora": ""
+  },
+  "lluvia_dia": {
+    "valor": 3.3,
+    "fecha": "2026-08-14",
     "hora": ""
   }
 }
