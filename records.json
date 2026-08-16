@@ -10,9 +10,9 @@
     "hora": "08:29"
   },
   "racha_max": {
-    "valor": 36.5,
-    "fecha": "2026-08-08",
-    "hora": "17:23"
+    "valor": 37.3,
+    "fecha": "2026-08-16",
+    "hora": "04:29"
   },
   "presion_max": {
     "valor": 1019.98,
@@ -25,13 +25,13 @@
     "hora": ""
   },
   "solar_max": {
-    "valor": 816.2,
-    "fecha": "2026-08-10",
-    "hora": "14:24"
+    "valor": 895.7,
+    "fecha": "2026-08-16",
+    "hora": "13:39"
   },
   "uv_max": {
-    "valor": 10.0,
-    "fecha": "2026-08-10",
+    "valor": 11.0,
+    "fecha": "2026-08-16",
     "hora": ""
   },
   "lluvia_dia": {
