@@ -25,13 +25,13 @@
     "hora": ""
   },
   "solar_max": {
-    "valor": 895.7,
-    "fecha": "2026-08-16",
-    "hora": "13:39"
+    "valor": 1055.0,
+    "fecha": "2026-08-20",
+    "hora": "14:29"
   },
   "uv_max": {
-    "valor": 11.0,
-    "fecha": "2026-08-16",
+    "valor": 14.0,
+    "fecha": "2026-08-20",
     "hora": ""
   },
   "lluvia_dia": {
