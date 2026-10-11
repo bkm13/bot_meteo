@@ -7,6 +7,9 @@ Modos de ejecución (systemd timers):
   registro  23:57  - Registro definitivo del día (Excel, récords, GitHub), silencioso
   mensual   día 1  - Medias del mes anterior en medias_mensuales.xlsx + GitHub
 
+El resumen de las 21:00 incluye la lluvia acumulada del año hidrológico
+(1 de septiembre – 31 de agosto), calculada sumando la hoja Diario.
+
 Variables de entorno necesarias (/etc/bot-meteo.env):
   WU_API_KEY        - API key de Weather Underground
   WU_STATION_ID     - ID de la estación (ej: ICARTA12)
@@ -48,6 +51,9 @@ WU_URL = (
     "https://api.weather.com/v2/pws/observations/all/1day"
     "?stationId={station}&format=json&units=m&numericPrecision=decimal&apiKey={key}"
 )
+
+# Año hidrológico: 1 de septiembre – 31 de agosto
+MES_INICIO_HIDRO = 9
 
 logging.basicConfig(
     level=logging.INFO,
@@ -384,6 +390,60 @@ def leer_dias_del_mes(anio, mes):
     return dias
 
 
+# ---------------------------------------------------------------------------
+# Año hidrológico (1 sep – 31 ago)
+# ---------------------------------------------------------------------------
+def anio_hidrologico(d):
+    """Devuelve (fecha_inicio, etiqueta) del año hidrológico al que pertenece d."""
+    anio_ini = d.year if d.month >= MES_INICIO_HIDRO else d.year - 1
+    return date(anio_ini, MES_INICIO_HIDRO, 1), f"{anio_ini}-{str(anio_ini + 1)[-2:]}"
+
+
+def lluvia_acumulada_hidro(hoy, incluir_hoy=True):
+    """Suma la columna 'Lluvia (mm)' de la hoja Diario desde el 1 de septiembre
+    del año hidrológico en curso hasta hoy. Devuelve float, o None si falla.
+    Se calcula desde el Excel, así que re-ejecutar un día no duplica la suma."""
+    inicio, _ = anio_hidrologico(hoy)
+    if not EXCEL_PATH.exists():
+        return 0.0
+    total = 0.0
+    try:
+        wb = load_workbook(EXCEL_PATH, read_only=True, data_only=True)
+        if "Diario" not in wb.sheetnames:
+            wb.close()
+            return 0.0
+        filas = wb["Diario"].iter_rows(values_only=True)
+        cabecera = next(filas, None) or ()
+        idx = {str(nombre): i for i, nombre in enumerate(cabecera) if nombre}
+        i_fecha, i_lluvia = idx.get("Fecha"), idx.get("Lluvia (mm)")
+        if i_fecha is None or i_lluvia is None:
+            wb.close()
+            log.warning("Hoja Diario sin columnas Fecha/Lluvia; no se calcula el año hidrológico")
+            return None
+        for fila in filas:
+            if not fila or len(fila) <= max(i_fecha, i_lluvia) or not fila[i_fecha]:
+                continue
+            try:
+                f = datetime.strptime(str(fila[i_fecha]).strip(), "%d/%m/%Y").date()
+            except ValueError:
+                continue
+            if f < inicio or f > hoy or (f == hoy and not incluir_hoy):
+                continue
+            total += _flt(fila[i_lluvia]) or 0.0
+        wb.close()
+    except Exception as e:
+        log.warning("No se pudo calcular la lluvia del año hidrológico: %s", e)
+        return None
+    return total
+
+
+def linea_hidro(total, hoy):
+    if total is None:
+        return None
+    _, etiqueta = anio_hidrologico(hoy)
+    return f"🪣 Año hidrológico {etiqueta}: <b>{total:.1f} L/m²</b>"
+
+
 def calcular_medias_mes(dias):
     """A partir de la lista de días, calcula el resumen mensual."""
     def maximo(clave):
@@ -571,7 +631,7 @@ def guardar_snapshot(resumen, hoy):
         log.warning("No se pudo guardar el snapshot: %s", e)
 
 
-def novedades_desde_snapshot(resumen, hoy):
+def novedades_desde_snapshot(resumen, hoy, total_hidro=None):
     """Compara el día completo con la foto de las 21:00.
     Devuelve lista de líneas si llovió más o el viento superó la racha."""
     if not SNAPSHOT_PATH.exists():
@@ -595,6 +655,10 @@ def novedades_desde_snapshot(resumen, hoy):
             f"🌧 Lluvia: <b>{lluvia_final:.1f} mm</b> en el día "
             f"(+{delta:.1f} mm desde las 21:00)"
         )
+        # El acumulado anual dado a las 21:00 ha cambiado: se actualiza
+        linea = linea_hidro(total_hidro, hoy)
+        if linea:
+            lineas.append(linea)
 
     racha_2100 = snap.get("racha_max")
     racha_final = resumen["racha_max"]
@@ -612,7 +676,7 @@ def _fmt(valor, unidad=""):
     return f"{valor:.1f}{unidad}" if valor is not None else "n/d"
 
 
-def construir_mensaje(resumen, batidos, hoy):
+def construir_mensaje(resumen, batidos, hoy, total_hidro=None):
     lineas = [
         f"🌦 <b>Resumen meteo — {hoy.strftime('%d/%m/%Y')}</b>",
         "",
@@ -622,6 +686,9 @@ def construir_mensaje(resumen, batidos, hoy):
     ]
     if resumen["lluvia"] and resumen["lluvia"] > 0:
         lineas.append(f"🌧 Lluvia: <b>{resumen['lluvia']:.1f} mm</b>")
+    linea = linea_hidro(total_hidro, hoy)
+    if linea:
+        lineas.append(linea)
     lineas.append(
         f"🔵 Presión: <b>{_fmt(resumen['presion_min'])} – {_fmt(resumen['presion_max'])} hPa</b>"
     )
@@ -707,16 +774,22 @@ def main():
 
     if modo == "resumen":
         # 21:00 — mensaje informativo + foto de lluvia/viento para comparar luego
-        enviar_telegram(construir_mensaje(resumen, [], hoy))
+        # Acumulado hidrológico: días ya registrados + lo que lleva hoy
+        total_hidro = lluvia_acumulada_hidro(hoy, incluir_hoy=False)
+        if total_hidro is not None:
+            total_hidro += resumen["lluvia"] or 0.0
+        enviar_telegram(construir_mensaje(resumen, [], hoy, total_hidro))
         guardar_snapshot(resumen, hoy)
     else:
         # 23:57 — registro definitivo del día completo, sin despertar a nadie
         batidos = comprobar_records(resumen, hoy)
         registrar_en_excel(resumen, batidos, hoy)
+        total_hidro = lluvia_acumulada_hidro(hoy, incluir_hoy=True)
+        log.info("Lluvia año hidrológico: %s mm", total_hidro)
 
         bloques = []
 
-        novedades = novedades_desde_snapshot(resumen, hoy)
+        novedades = novedades_desde_snapshot(resumen, hoy, total_hidro)
         if novedades:
             bloques.append(
                 "\n".join([f"🌙 <b>Novedades desde las 21:00 — {hoy.strftime('%d/%m/%Y')}</b>"]
