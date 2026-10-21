@@ -9,6 +9,8 @@ mediante long polling y responde a comandos:
   /hoy      - Extremos del día hasta ahora (máx/mín, racha, lluvia...)
   /records  - Récords históricos guardados en records.json
   /mensual  - Menú con botones: año -> mes -> resumen mensual completo
+                El resumen trae un botón "Ver días de lluvia" con el desglose
+                diario (cantidad, hora de inicio/fin e intensidad máxima)
   /mes      - Resumen de un mes escrito a mano: /mes septiembre 2026,
               /mes 9 2026, /mes 09/2026 (también /septiembre 2026)
   /ayuda    - Lista de comandos
@@ -32,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bot_meteo import (  # noqa: E402
     descargar_observaciones, calcular_resumen, _flt, _fmt,
     leer_diario, meses_con_datos, resumen_mensual, NOMBRES_MES,
+    teclado_lluvia, construir_mensaje_lluvia_mes, texto_detalle_lluvia,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -139,7 +142,9 @@ def mensaje_hoy():
         f"🌡 Máxima: <b>{_fmt(r['temp_max'], '°C')}</b> ({r['hora_temp_max'] or '—'})",
         f"❄️ Mínima: <b>{_fmt(r['temp_min'], '°C')}</b> ({r['hora_temp_min'] or '—'})",
         f"💨 Racha máx: <b>{_fmt(r['racha_max'], ' km/h')}</b> ({r['hora_racha'] or '—'})",
-        f"🌧 Lluvia: <b>{r['lluvia']:.1f} mm</b>",
+        f"🌧 Lluvia: <b>{r['lluvia']:.1f} mm</b>"
+        + texto_detalle_lluvia(r["lluvia_ini"], r["lluvia_fin"],
+                               r["intensidad_max"], r["hora_intensidad"]),
         f"🔵 Presión: {_fmt(r['presion_min'])} – {_fmt(r['presion_max'])} hPa",
         f"💧 Humedad: {_fmt(r['humedad_min'], '%')} – {_fmt(r['humedad_max'], '%')}",
     ]
@@ -220,13 +225,29 @@ def menu_mensual(anio=None):
     )
 
 
-def texto_resumen_mes(anio, mes):
+AVISO_LECTURA = "⚠️ No se pudo leer el registro (¿se está guardando ahora mismo?). Prueba en un minuto."
+
+
+def enviar_resumen_mes(anio, mes):
+    """Envía el resumen del mes con el botón de días de lluvia."""
     try:
         texto, _ = resumen_mensual(anio, mes, date.today(), leer_diario())
     except Exception as e:
         log.warning("Error calculando el resumen de %02d/%d: %s", mes, anio, e)
-        return "⚠️ No se pudo leer el registro (¿se está guardando ahora mismo?). Prueba en un minuto."
-    return texto or f"No hay datos registrados de {NOMBRES_MES[mes]} {anio}."
+        enviar(AVISO_LECTURA)
+        return
+    if not texto:
+        enviar(f"No hay datos registrados de {NOMBRES_MES[mes]} {anio}.")
+        return
+    enviar(texto, teclado_lluvia(anio, mes))
+
+
+def enviar_lluvia_mes(anio, mes):
+    try:
+        enviar(construir_mensaje_lluvia_mes(anio, mes))
+    except Exception as e:
+        log.warning("Error calculando la lluvia de %02d/%d: %s", mes, anio, e)
+        enviar(AVISO_LECTURA)
 
 
 def interpretar_mes(args):
@@ -324,7 +345,10 @@ def procesar_callback(cq):
         elif datos.startswith("m:"):
             _, anio, mes = datos.split(":")
             # El resumen va en un mensaje nuevo; el menú queda para seguir consultando
-            enviar(texto_resumen_mes(int(anio), int(mes)))
+            enviar_resumen_mes(int(anio), int(mes))
+        elif datos.startswith("l:"):
+            _, anio, mes = datos.split(":")
+            enviar_lluvia_mes(int(anio), int(mes))
     except Exception as e:
         log.warning("Error procesando botón %s: %s", datos, e)
 
@@ -358,7 +382,7 @@ def procesar_comando(texto):
             enviar("No entiendo el mes. Ejemplos: <code>/mes septiembre 2026</code>, "
                    "<code>/mes 9 2026</code>, <code>/mes 09/2026</code> — o usa /mensual.")
             return
-        enviar(texto_resumen_mes(*objetivo))
+        enviar_resumen_mes(*objetivo)
     elif cmd in ("/ayuda", "/help", "/start"):
         enviar(AYUDA)
 

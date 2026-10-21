@@ -73,6 +73,9 @@ CABECERA_DIARIO = [
     "Humedad Máx (%)", "Humedad Mín (%)",
     "Radiación Máx (W/m²)", "Hora Radiación", "UV Máx",
     "Nº Observaciones",
+    # Columnas nuevas SIEMPRE al final: _sincronizar_cabecera reescribe la
+    # fila 1 por posición y una inserción en medio desplaza las filas antiguas
+    "Inicio Lluvia", "Fin Lluvia", "Intensidad Máx (mm/h)", "Hora Intensidad",
 ]
 CABECERA_RECORDS = ["Tipo de récord", "Valor", "Fecha", "Hora", "Récord anterior", "Detalles"]
 CABECERA_MENSUAL = [
@@ -132,6 +135,8 @@ def calcular_resumen(observaciones):
         "humedad_max": None, "humedad_min": None,
         "solar_max": None, "hora_solar": "",
         "uv_max": None,
+        "lluvia_ini": "", "lluvia_fin": "",
+        "intensidad_max": None, "hora_intensidad": "",
         "n_obs": len(observaciones),
     }
 
@@ -187,7 +192,58 @@ def calcular_resumen(observaciones):
         if lluvia is not None and lluvia > resumen["lluvia"]:
             resumen["lluvia"] = lluvia
 
+    resumen.update(calcular_lluvia_detalle(observaciones))
     return resumen
+
+
+def calcular_lluvia_detalle(observaciones):
+    """Hora de inicio/fin de la lluvia del día e intensidad máxima (mm/h).
+    Inicio/fin: primera y última observación en que sube precipTotal.
+    Intensidad: máximo de precipRate; si la estación no lo da, se estima
+    con la subida de precipTotal entre observaciones consecutivas."""
+    ordenadas = sorted(observaciones, key=lambda o: o.get("obsTimeLocal", ""))
+    ini = fin = ""
+    int_max, hora_int = None, ""
+    est_max, hora_est = None, ""
+    acumulado = 0.0
+    t_prev = None
+
+    for obs in ordenadas:
+        m = obs.get("metric", {}) or {}
+        hora = _hora(obs)
+        try:
+            t = datetime.strptime(obs.get("obsTimeLocal", "")[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            t = None
+
+        total = _flt(m.get("precipTotal"))
+        if total is not None and total > acumulado + 0.001:
+            delta = total - acumulado
+            if not ini:
+                ini = hora
+            fin = hora
+            if t is not None and t_prev is not None:
+                minutos = (t - t_prev).total_seconds() / 60
+                if 0 < minutos <= 30:
+                    estimada = delta / minutos * 60
+                    if est_max is None or estimada > est_max:
+                        est_max, hora_est = estimada, hora
+            acumulado = total
+        if t is not None:
+            t_prev = t
+
+        ritmo = _flt(m.get("precipRate"))
+        if ritmo is not None and ritmo > 0 and (int_max is None or ritmo > int_max):
+            int_max, hora_int = ritmo, hora
+
+    if int_max is None and est_max is not None:
+        int_max, hora_int = round(est_max, 1), hora_est
+    if not ini:  # sin lluvia: no se registra intensidad
+        int_max, hora_int = None, ""
+    return {
+        "lluvia_ini": ini, "lluvia_fin": fin,
+        "intensidad_max": int_max, "hora_intensidad": hora_int,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +332,28 @@ def abrir_excel():
     if "Récords" not in wb.sheetnames:
         wb.create_sheet("Récords").append(CABECERA_RECORDS)
     _sincronizar_cabecera(wb["Diario"], CABECERA_DIARIO)
+    _reparar_filas_sin_radiacion(wb["Diario"])
     return wb
+
+
+def _reparar_filas_sin_radiacion(ws):
+    """Corrige las filas anteriores a la columna de radiación/UV (agosto 2026):
+    al insertar esas columnas, su 'Nº Observaciones' quedó en 'Radiación Máx'.
+    Solo toca filas con radiación pero sin hora de radiación, UV ni Nº obs."""
+    col = {str(c.value): c.column for c in ws[1] if c.value}
+    c_rad, c_hora = col.get("Radiación Máx (W/m²)"), col.get("Hora Radiación")
+    c_uv, c_obs = col.get("UV Máx"), col.get("Nº Observaciones")
+    if None in (c_rad, c_hora, c_uv, c_obs):
+        return
+    for fila in range(2, ws.max_row + 1):
+        rad = ws.cell(row=fila, column=c_rad).value
+        if (rad is not None and ws.cell(row=fila, column=c_hora).value in (None, "")
+                and ws.cell(row=fila, column=c_uv).value is None
+                and ws.cell(row=fila, column=c_obs).value is None):
+            ws.cell(row=fila, column=c_obs, value=rad)
+            ws.cell(row=fila, column=c_rad).value = None  # cell(value=None) no borra
+            log.info("Fila %s reparada: Nº observaciones movido desde radiación",
+                     ws.cell(row=fila, column=1).value)
 
 
 def registrar_en_excel(resumen, batidos, hoy):
@@ -300,6 +377,8 @@ def registrar_en_excel(resumen, batidos, hoy):
         resumen["humedad_max"], resumen["humedad_min"],
         resumen["solar_max"], resumen["hora_solar"], resumen["uv_max"],
         resumen["n_obs"],
+        resumen["lluvia_ini"], resumen["lluvia_fin"],
+        resumen["intensidad_max"], resumen["hora_intensidad"],
     ])
 
     ws_rec = wb["Récords"]
@@ -363,6 +442,12 @@ CAMPOS_DIARIO = {
     "hum_min": "Humedad Mín (%)",
     "solar": "Radiación Máx (W/m²)",
     "uv": "UV Máx",
+    "intensidad": "Intensidad Máx (mm/h)",
+}
+CAMPOS_TEXTO_DIARIO = {
+    "lluvia_ini": "Inicio Lluvia",
+    "lluvia_fin": "Fin Lluvia",
+    "hora_intensidad": "Hora Intensidad",
 }
 
 
@@ -393,6 +478,10 @@ def leer_diario():
             for clave, columna in CAMPOS_DIARIO.items():
                 i = idx.get(columna)
                 dia[clave] = _flt(fila[i]) if i is not None and i < len(fila) else None
+            for clave, columna in CAMPOS_TEXTO_DIARIO.items():
+                i = idx.get(columna)
+                valor = fila[i] if i is not None and i < len(fila) else None
+                dia[clave] = str(valor).strip() if valor not in (None, "") else ""
             dias.append(dia)
         return dias
     finally:
@@ -612,6 +701,64 @@ def construir_mensaje_mensual(stats, anio, mes, dias_todos=None, en_curso_hasta=
     return "\n".join(lineas)
 
 
+def texto_detalle_lluvia(ini, fin, intensidad, hora_int):
+    """' · de 17:05 a 18:40 · intensidad máx 12.4 mm/h (17:20)' o '' si no hay datos."""
+    partes = []
+    if ini and fin and ini != fin:
+        partes.append(f"de {ini} a {fin}")
+    elif ini:
+        partes.append(f"a las {ini}")
+    if intensidad is not None:
+        hora_txt = f" ({hora_int})" if hora_int else ""
+        partes.append(f"intensidad máx {intensidad:.1f} mm/h{hora_txt}")
+    return "".join(f" · {p}" for p in partes)
+
+
+def teclado_lluvia(anio, mes):
+    """Botón que se adjunta a cualquier resumen mensual (lo atiende el listener)."""
+    return {"inline_keyboard": [[
+        {"text": "🌧 Ver días de lluvia", "callback_data": f"l:{anio}:{mes}"}
+    ]]}
+
+
+def construir_mensaje_lluvia_mes(anio, mes, dias_todos=None):
+    """Lista de días con lluvia del mes, con hora e intensidad cuando se registraron."""
+    dias = leer_dias_del_mes(anio, mes, dias_todos)
+    nombre = f"{NOMBRES_MES[mes].capitalize()} {anio}"
+    if not dias:
+        return f"No hay datos registrados de {NOMBRES_MES[mes]} {anio}."
+    lluviosos = [d for d in dias if (d["lluvia"] or 0) > 0]
+    if not lluviosos:
+        return f"☀️ <b>{nombre}</b>: sin lluvia registrada ({len(dias)} días con datos)."
+
+    lineas = [f"🌧 <b>Días de lluvia — {nombre}</b>", ""]
+    for d in lluviosos:
+        detalle = texto_detalle_lluvia(
+            d.get("lluvia_ini"), d.get("lluvia_fin"), d.get("intensidad"), d.get("hora_intensidad")
+        )
+        lineas.append(f"• {d['fecha'].strftime('%d/%m')}: <b>{d['lluvia']:.1f} L/m²</b>{detalle}")
+
+    total = sum(d["lluvia"] for d in lluviosos)
+    mas = max(lluviosos, key=lambda d: d["lluvia"])
+    n = len(lluviosos)
+    lineas += [
+        "",
+        f"Total: <b>{total:.1f} L/m²</b> en {n} {'día' if n == 1 else 'días'}",
+        f"Día más lluvioso: {mas['fecha'].strftime('%d/%m')} ({mas['lluvia']:.1f} L/m²)",
+    ]
+    con_int = [d for d in lluviosos if d.get("intensidad") is not None]
+    if con_int:
+        fuerte = max(con_int, key=lambda d: d["intensidad"])
+        hora_txt = f" a las {fuerte['hora_intensidad']}" if fuerte.get("hora_intensidad") else ""
+        lineas.append(
+            f"Mayor intensidad: {fuerte['intensidad']:.1f} mm/h "
+            f"({fuerte['fecha'].strftime('%d/%m')}{hora_txt})"
+        )
+    if len(con_int) < n:
+        lineas.append("<i>Los días sin hora ni intensidad son anteriores a que se empezaran a registrar.</i>")
+    return "\n".join(lineas)
+
+
 def resumen_mensual(anio, mes, hoy=None, dias_todos=None):
     """Resumen de cualquier mes calculado al vuelo desde la hoja Diario.
     Devuelve (texto, stats) o (None, None) si no hay días de ese mes.
@@ -646,7 +793,7 @@ def ejecutar_mensual(hoy):
         return
 
     registrar_medias(stats, anio, mes)
-    enviar_telegram(texto)
+    enviar_telegram(texto, teclado=teclado_lluvia(anio, mes))
     subir_a_github(hoy, f"Medias mensuales {mes:02d}/{anio}")
 
 
@@ -722,6 +869,10 @@ def novedades_desde_snapshot(resumen, hoy, total_hidro=None, total_mes=None):
         lineas.append(
             f"🌧 Lluvia: <b>{lluvia_final:.1f} mm</b> en el día "
             f"(+{delta:.1f} mm desde las 21:00)"
+            + texto_detalle_lluvia(
+                resumen.get("lluvia_ini"), resumen.get("lluvia_fin"),
+                resumen.get("intensidad_max"), resumen.get("hora_intensidad"),
+            )
         )
         # Los acumulados dados a las 21:00 han cambiado: se actualizan
         for linea in (linea_mes(total_mes, hoy), linea_hidro(total_hidro, hoy)):
@@ -753,7 +904,11 @@ def construir_mensaje(resumen, batidos, hoy, total_hidro=None, total_mes=None):
         f"💨 Racha máx: <b>{_fmt(resumen['racha_max'], ' km/h')}</b> ({resumen['hora_racha'] or '—'})",
     ]
     if resumen["lluvia"] and resumen["lluvia"] > 0:
-        lineas.append(f"🌧 Lluvia: <b>{resumen['lluvia']:.1f} mm</b>")
+        detalle = texto_detalle_lluvia(
+            resumen.get("lluvia_ini"), resumen.get("lluvia_fin"),
+            resumen.get("intensidad_max"), resumen.get("hora_intensidad"),
+        )
+        lineas.append(f"🌧 Lluvia: <b>{resumen['lluvia']:.1f} mm</b>{detalle}")
     for linea in (linea_mes(total_mes, hoy), linea_hidro(total_hidro, hoy)):
         if linea:
             lineas.append(linea)
@@ -781,7 +936,7 @@ def construir_mensaje(resumen, batidos, hoy, total_hidro=None, total_mes=None):
     return "\n".join(lineas)
 
 
-def enviar_telegram(texto, silencioso=False):
+def enviar_telegram(texto, silencioso=False, teclado=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -789,6 +944,8 @@ def enviar_telegram(texto, silencioso=False):
         "parse_mode": "HTML",
         "disable_notification": silencioso,
     }
+    if teclado:
+        payload["reply_markup"] = teclado
     for intento in range(3):
         try:
             r = requests.post(url, json=payload, timeout=30)
