@@ -8,6 +8,9 @@ mediante long polling y responde a comandos:
   /tiempo   - Condiciones actuales de la estación (última observación de WU)
   /hoy      - Extremos del día hasta ahora (máx/mín, racha, lluvia...)
   /records  - Récords históricos guardados en records.json
+  /mensual  - Menú con botones: año -> mes -> resumen mensual completo
+  /mes      - Resumen de un mes escrito a mano: /mes septiembre 2026,
+              /mes 9 2026, /mes 09/2026 (también /septiembre 2026)
   /ayuda    - Lista de comandos
 
 Usa las mismas variables de entorno que bot_meteo.py (/etc/bot-meteo.env).
@@ -19,6 +22,7 @@ import sys
 import json
 import time
 import logging
+from datetime import date
 from pathlib import Path
 
 import requests
@@ -27,6 +31,7 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bot_meteo import (  # noqa: E402
     descargar_observaciones, calcular_resumen, _flt, _fmt,
+    leer_diario, meses_con_datos, resumen_mensual, NOMBRES_MES,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -177,11 +182,85 @@ def mensaje_records():
     return "\n".join(lineas)
 
 
+# ---------------------------------------------------------------------------
+# Resumen mensual bajo demanda (/mensual con botones, /mes escrito)
+# ---------------------------------------------------------------------------
+ABREV_MES = ["", "Ene", "Feb", "Mar", "Abr", "May", "Jun",
+             "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+
+
+def teclado_anios(disponibles):
+    botones = [{"text": str(a), "callback_data": f"y:{a}"} for a in disponibles]
+    return {"inline_keyboard": [botones[i:i + 4] for i in range(0, len(botones), 4)]}
+
+
+def teclado_meses(anio, meses, hay_mas_anios):
+    botones = [
+        {"text": ABREV_MES[m], "callback_data": f"m:{anio}:{m}"} for m in meses
+    ]
+    filas = [botones[i:i + 4] for i in range(0, len(botones), 4)]
+    if hay_mas_anios:
+        filas.append([{"text": "« Años", "callback_data": "a"}])
+    return {"inline_keyboard": filas}
+
+
+def menu_mensual(anio=None):
+    """Devuelve (texto, teclado) del menú. Sin año: lista de años
+    (o directamente los meses si solo hay un año con datos)."""
+    disponibles = meses_con_datos()
+    if not disponibles:
+        return "Todavía no hay días registrados.", None
+    if anio is None and len(disponibles) == 1:
+        anio = next(iter(disponibles))
+    if anio is None or anio not in disponibles:
+        return "📅 <b>Resúmenes mensuales</b>\nElige un año:", teclado_anios(disponibles)
+    return (
+        f"📅 <b>Resúmenes mensuales — {anio}</b>\nElige un mes:",
+        teclado_meses(anio, disponibles[anio], len(disponibles) > 1),
+    )
+
+
+def texto_resumen_mes(anio, mes):
+    try:
+        texto, _ = resumen_mensual(anio, mes, date.today(), leer_diario())
+    except Exception as e:
+        log.warning("Error calculando el resumen de %02d/%d: %s", mes, anio, e)
+        return "⚠️ No se pudo leer el registro (¿se está guardando ahora mismo?). Prueba en un minuto."
+    return texto or f"No hay datos registrados de {NOMBRES_MES[mes]} {anio}."
+
+
+def interpretar_mes(args):
+    """Convierte ['septiembre', '2026'], ['9', '2026'], ['09/2026'] o ['sept']
+    en (año, mes). Sin año: el más reciente con ese mes que no sea futuro."""
+    tokens = " ".join(args).replace("/", " ").replace("-", " ").lower().split()
+    mes = anio = None
+    for t in tokens:
+        if t.isdigit():
+            n = int(t)
+            if n > 12:
+                anio = n
+            elif mes is None:
+                mes = n
+        else:
+            for i, nombre in enumerate(NOMBRES_MES):
+                if i and len(t) >= 3 and nombre.startswith(t):
+                    mes = i
+                    break
+    if not mes or not 1 <= mes <= 12:
+        return None
+    if anio is None:
+        hoy = date.today()
+        anio = hoy.year if mes <= hoy.month else hoy.year - 1
+    return anio, mes
+
+
 AYUDA = (
     "🤖 <b>Bot Meteo — comandos</b>\n\n"
     "/tiempo — condiciones actuales de la estación\n"
     "/hoy — extremos del día hasta ahora\n"
     "/records — récords históricos\n"
+    "/mensual — menú de resúmenes mensuales (botones)\n"
+    "/mes septiembre 2026 — resumen de un mes concreto\n"
     "/ayuda — este mensaje"
 )
 
@@ -189,20 +268,75 @@ AYUDA = (
 # ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
-def enviar(texto):
+def _api(metodo, payload):
     try:
-        r = requests.post(
-            f"{API}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": texto, "parse_mode": "HTML"},
-            timeout=30,
-        )
+        r = requests.post(f"{API}/{metodo}", json=payload, timeout=30)
         r.raise_for_status()
+        return True
     except Exception as e:
-        log.warning("Error enviando mensaje: %s", e)
+        log.warning("Error en %s: %s", metodo, e)
+        return False
+
+
+def enviar(texto, teclado=None):
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": texto, "parse_mode": "HTML"}
+    if teclado:
+        payload["reply_markup"] = teclado
+    _api("sendMessage", payload)
+
+
+def editar(message_id, texto, teclado=None):
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id,
+               "text": texto, "parse_mode": "HTML"}
+    if teclado:
+        payload["reply_markup"] = teclado
+    _api("editMessageText", payload)
+
+
+def registrar_comandos():
+    """Publica la lista de comandos para que aparezca en el menú '/' de Telegram."""
+    _api("setMyCommands", {"commands": [
+        {"command": "tiempo", "description": "Condiciones actuales"},
+        {"command": "hoy", "description": "Extremos del día hasta ahora"},
+        {"command": "mensual", "description": "Resúmenes mensuales (menú)"},
+        {"command": "mes", "description": "Resumen de un mes: /mes septiembre 2026"},
+        {"command": "records", "description": "Récords históricos"},
+        {"command": "ayuda", "description": "Lista de comandos"},
+    ]})
+
+
+def procesar_callback(cq):
+    """Pulsaciones de los botones del menú mensual."""
+    msg = cq.get("message") or {}
+    chat_id = str((msg.get("chat") or {}).get("id", ""))
+    _api("answerCallbackQuery", {"callback_query_id": cq["id"]})  # quita el "cargando"
+    if chat_id != str(TELEGRAM_CHAT_ID):
+        return
+    datos = cq.get("data") or ""
+    log.info("Botón pulsado: %s", datos)
+    try:
+        if datos == "a":
+            texto, teclado = menu_mensual()
+            editar(msg["message_id"], texto, teclado)
+        elif datos.startswith("y:"):
+            texto, teclado = menu_mensual(int(datos[2:]))
+            editar(msg["message_id"], texto, teclado)
+        elif datos.startswith("m:"):
+            _, anio, mes = datos.split(":")
+            # El resumen va en un mensaje nuevo; el menú queda para seguir consultando
+            enviar(texto_resumen_mes(int(anio), int(mes)))
+    except Exception as e:
+        log.warning("Error procesando botón %s: %s", datos, e)
 
 
 def procesar_comando(texto):
-    cmd = texto.split()[0].split("@")[0].lower()  # admite /tiempo@MiBot
+    partes = texto.split()
+    cmd = partes[0].split("@")[0].lower()  # admite /tiempo@MiBot
+    args = partes[1:]
+    # Atajo: /septiembre 2026 equivale a /mes septiembre 2026
+    if cmd[1:] in NOMBRES_MES[1:]:
+        args = [cmd[1:]] + args
+        cmd = "/mes"
     if cmd == "/tiempo":
         obs = obtener_observacion_actual()
         enviar(mensaje_tiempo(obs) if obs else
@@ -211,6 +345,20 @@ def procesar_comando(texto):
         enviar(mensaje_hoy())
     elif cmd == "/records":
         enviar(mensaje_records())
+    elif cmd in ("/mensual", "/meses"):
+        texto_menu, teclado = menu_mensual()
+        enviar(texto_menu, teclado)
+    elif cmd == "/mes":
+        if not args:
+            texto_menu, teclado = menu_mensual()
+            enviar(texto_menu, teclado)
+            return
+        objetivo = interpretar_mes(args)
+        if not objetivo:
+            enviar("No entiendo el mes. Ejemplos: <code>/mes septiembre 2026</code>, "
+                   "<code>/mes 9 2026</code>, <code>/mes 09/2026</code> — o usa /mensual.")
+            return
+        enviar(texto_resumen_mes(*objetivo))
     elif cmd in ("/ayuda", "/help", "/start"):
         enviar(AYUDA)
 
@@ -227,16 +375,23 @@ def main():
         sys.exit(1)
 
     log.info("Listener iniciado; escuchando comandos de Telegram...")
+    registrar_comandos()
     offset = None
     while True:
         try:
-            params = {"timeout": 50, "allowed_updates": ["message"]}
+            # allowed_updates debe ir serializado en JSON; Telegram lo recuerda
+            # entre llamadas, por eso se pide explícitamente callback_query
+            params = {"timeout": 50,
+                      "allowed_updates": json.dumps(["message", "callback_query"])}
             if offset is not None:
                 params["offset"] = offset
             r = requests.get(f"{API}/getUpdates", params=params, timeout=60)
             r.raise_for_status()
             for update in r.json().get("result", []):
                 offset = update["update_id"] + 1
+                if update.get("callback_query"):
+                    procesar_callback(update["callback_query"])
+                    continue
                 msg = update.get("message") or {}
                 chat_id = str((msg.get("chat") or {}).get("id", ""))
                 texto = (msg.get("text") or "").strip()

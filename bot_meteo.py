@@ -7,8 +7,11 @@ Modos de ejecución (systemd timers):
   registro  23:57  - Registro definitivo del día (Excel, récords, GitHub), silencioso
   mensual   día 1  - Medias del mes anterior en medias_mensuales.xlsx + GitHub
 
-El resumen de las 21:00 incluye la lluvia acumulada del año hidrológico
-(1 de septiembre – 31 de agosto), calculada sumando la hoja Diario.
+El resumen de las 21:00 incluye la lluvia acumulada del mes en curso y la del
+año hidrológico (1 de septiembre – 31 de agosto), calculadas sumando la hoja
+Diario más lo que lleva el día. El resumen mensual incluye además el desglose
+mes a mes del año hidrológico. resumen_mensual() se reutiliza desde el
+listener para consultar cualquier mes bajo demanda (/mensual, /mes).
 
 Variables de entorno necesarias (/etc/bot-meteo.env):
   WU_API_KEY        - API key de Weather Underground
@@ -23,6 +26,7 @@ import csv
 import json
 import logging
 import subprocess
+import calendar
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
@@ -342,56 +346,76 @@ def _media(valores):
     return round(sum(valores) / len(valores), 1) if valores else None
 
 
-def leer_dias_del_mes(anio, mes):
-    """Lee la hoja Diario y devuelve los días del mes indicado como dicts."""
+NOMBRES_MES = [
+    "", "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
+
+# Columna de la hoja Diario -> clave interna
+CAMPOS_DIARIO = {
+    "temp_max": "Temp Máx (°C)",
+    "temp_min": "Temp Mín (°C)",
+    "racha": "Racha Máx (km/h)",
+    "lluvia": "Lluvia (mm)",
+    "presion_max": "Presión Máx (hPa)",
+    "presion_min": "Presión Mín (hPa)",
+    "hum_max": "Humedad Máx (%)",
+    "hum_min": "Humedad Mín (%)",
+    "solar": "Radiación Máx (W/m²)",
+    "uv": "UV Máx",
+}
+
+
+def leer_diario():
+    """Lee la hoja Diario completa y devuelve una lista de dicts por día
+    (clave 'fecha' como date + las claves de CAMPOS_DIARIO)."""
     if not EXCEL_PATH.exists():
         return []
     wb = load_workbook(EXCEL_PATH, read_only=True, data_only=True)
-    if "Diario" not in wb.sheetnames:
-        return []
-    ws = wb["Diario"]
+    try:
+        if "Diario" not in wb.sheetnames:
+            return []
+        filas = wb["Diario"].iter_rows(values_only=True)
+        cabecera = next(filas, None) or ()
+        idx = {str(nombre): i for i, nombre in enumerate(cabecera) if nombre}
+        i_fecha = idx.get("Fecha")
+        if i_fecha is None:
+            return []
+        dias = []
+        for fila in filas:
+            if not fila or len(fila) <= i_fecha or not fila[i_fecha]:
+                continue
+            try:
+                f = datetime.strptime(str(fila[i_fecha]).strip(), "%d/%m/%Y").date()
+            except ValueError:
+                continue
+            dia = {"fecha": f}
+            for clave, columna in CAMPOS_DIARIO.items():
+                i = idx.get(columna)
+                dia[clave] = _flt(fila[i]) if i is not None and i < len(fila) else None
+            dias.append(dia)
+        return dias
+    finally:
+        wb.close()
 
-    filas = ws.iter_rows(values_only=True)
-    cabecera = next(filas, None)
-    if not cabecera:
-        return []
-    idx = {str(nombre): i for i, nombre in enumerate(cabecera) if nombre}
 
-    def celda(fila, nombre):
-        i = idx.get(nombre)
-        if i is None or i >= len(fila):
-            return None
-        return fila[i]
+def leer_dias_del_mes(anio, mes, dias=None):
+    """Días del mes indicado (lee la hoja Diario si no se le pasan)."""
+    dias = leer_diario() if dias is None else dias
+    return [d for d in dias if d["fecha"].year == anio and d["fecha"].month == mes]
 
-    dias = []
-    for fila in filas:
-        fecha_raw = celda(fila, "Fecha")
-        if not fecha_raw:
-            continue
-        try:
-            f = datetime.strptime(str(fecha_raw).strip(), "%d/%m/%Y").date()
-        except ValueError:
-            continue
-        if f.year != anio or f.month != mes:
-            continue
-        dias.append({
-            "fecha": f,
-            "temp_max": _flt(celda(fila, "Temp Máx (°C)")),
-            "temp_min": _flt(celda(fila, "Temp Mín (°C)")),
-            "racha": _flt(celda(fila, "Racha Máx (km/h)")),
-            "lluvia": _flt(celda(fila, "Lluvia (mm)")),
-            "presion_max": _flt(celda(fila, "Presión Máx (hPa)")),
-            "presion_min": _flt(celda(fila, "Presión Mín (hPa)")),
-            "hum_max": _flt(celda(fila, "Humedad Máx (%)")),
-            "hum_min": _flt(celda(fila, "Humedad Mín (%)")),
-            "solar": _flt(celda(fila, "Radiación Máx (W/m²)")),
-            "uv": _flt(celda(fila, "UV Máx")),
-        })
-    return dias
+
+def meses_con_datos(dias=None):
+    """{año: [meses con al menos un día registrado]} ordenado."""
+    dias = leer_diario() if dias is None else dias
+    resultado = {}
+    for d in dias:
+        resultado.setdefault(d["fecha"].year, set()).add(d["fecha"].month)
+    return {a: sorted(m) for a, m in sorted(resultado.items())}
 
 
 # ---------------------------------------------------------------------------
-# Año hidrológico (1 sep – 31 ago)
+# Año hidrológico (1 sep – 31 ago) y lluvia acumulada
 # ---------------------------------------------------------------------------
 def anio_hidrologico(d):
     """Devuelve (fecha_inicio, etiqueta) del año hidrológico al que pertenece d."""
@@ -399,42 +423,37 @@ def anio_hidrologico(d):
     return date(anio_ini, MES_INICIO_HIDRO, 1), f"{anio_ini}-{str(anio_ini + 1)[-2:]}"
 
 
-def lluvia_acumulada_hidro(hoy, incluir_hoy=True):
-    """Suma la columna 'Lluvia (mm)' de la hoja Diario desde el 1 de septiembre
-    del año hidrológico en curso hasta hoy. Devuelve float, o None si falla.
+def _suma_lluvia(dias, desde, hasta, incluir_hasta=True):
+    return sum(
+        d["lluvia"] or 0.0 for d in dias
+        if desde <= d["fecha"] <= hasta and (incluir_hasta or d["fecha"] != hasta)
+    )
+
+
+def acumulados_lluvia(hoy, incluir_hoy=True):
+    """Lluvia acumulada (mes en curso, año hidrológico) sumando la hoja Diario.
+    Devuelve (total_mes, total_hidro), o (None, None) si falla la lectura.
     Se calcula desde el Excel, así que re-ejecutar un día no duplica la suma."""
-    inicio, _ = anio_hidrologico(hoy)
-    if not EXCEL_PATH.exists():
-        return 0.0
-    total = 0.0
     try:
-        wb = load_workbook(EXCEL_PATH, read_only=True, data_only=True)
-        if "Diario" not in wb.sheetnames:
-            wb.close()
-            return 0.0
-        filas = wb["Diario"].iter_rows(values_only=True)
-        cabecera = next(filas, None) or ()
-        idx = {str(nombre): i for i, nombre in enumerate(cabecera) if nombre}
-        i_fecha, i_lluvia = idx.get("Fecha"), idx.get("Lluvia (mm)")
-        if i_fecha is None or i_lluvia is None:
-            wb.close()
-            log.warning("Hoja Diario sin columnas Fecha/Lluvia; no se calcula el año hidrológico")
-            return None
-        for fila in filas:
-            if not fila or len(fila) <= max(i_fecha, i_lluvia) or not fila[i_fecha]:
-                continue
-            try:
-                f = datetime.strptime(str(fila[i_fecha]).strip(), "%d/%m/%Y").date()
-            except ValueError:
-                continue
-            if f < inicio or f > hoy or (f == hoy and not incluir_hoy):
-                continue
-            total += _flt(fila[i_lluvia]) or 0.0
-        wb.close()
+        dias = leer_diario()
     except Exception as e:
-        log.warning("No se pudo calcular la lluvia del año hidrológico: %s", e)
+        log.warning("No se pudo leer la hoja Diario para la lluvia acumulada: %s", e)
+        return None, None
+    inicio_hidro, _ = anio_hidrologico(hoy)
+    total_mes = _suma_lluvia(dias, hoy.replace(day=1), hoy, incluir_hoy)
+    total_hidro = _suma_lluvia(dias, inicio_hidro, hoy, incluir_hoy)
+    return total_mes, total_hidro
+
+
+def lluvia_acumulada_hidro(hoy, incluir_hoy=True):
+    """Compatibilidad: solo el acumulado del año hidrológico."""
+    return acumulados_lluvia(hoy, incluir_hoy)[1]
+
+
+def linea_mes(total, hoy):
+    if total is None:
         return None
-    return total
+    return f"🗓 Lluvia en {NOMBRES_MES[hoy.month]}: <b>{total:.1f} L/m²</b>"
 
 
 def linea_hidro(total, hoy):
@@ -442,6 +461,33 @@ def linea_hidro(total, hoy):
         return None
     _, etiqueta = anio_hidrologico(hoy)
     return f"🪣 Año hidrológico {etiqueta}: <b>{total:.1f} L/m²</b>"
+
+
+def bloque_lluvia_hidro(anio, mes, dias, hasta=None):
+    """Desglose mes a mes de la lluvia del año hidrológico al que pertenece
+    el mes indicado, desde el 1 de septiembre hasta el final de ese mes
+    (o hasta 'hasta' si el mes está en curso)."""
+    fin = hasta or date(anio, mes, calendar.monthrange(anio, mes)[1])
+    inicio, etiqueta = anio_hidrologico(fin)
+    del_periodo = [d for d in dias if inicio <= d["fecha"] <= fin]
+    if not del_periodo:
+        return []
+
+    por_mes = {}
+    for d in del_periodo:
+        clave = (d["fecha"].year, d["fecha"].month)
+        por_mes[clave] = por_mes.get(clave, 0.0) + (d["lluvia"] or 0.0)
+    total = sum(por_mes.values())
+
+    hasta_txt = f"hasta el {hasta.strftime('%d/%m')}" if hasta else f"a fin de {NOMBRES_MES[mes]}"
+    lineas = [f"🪣 <b>Año hidrológico {etiqueta}</b> ({hasta_txt}): <b>{total:.1f} L/m²</b>"]
+    for (a, m), mm in sorted(por_mes.items()):
+        lineas.append(f"   • {NOMBRES_MES[m].capitalize()} {a}: {mm:.1f} L/m²")
+
+    primer_dia = min(d["fecha"] for d in del_periodo)
+    if primer_dia > inicio:
+        lineas.append(f"   <i>(registro desde el {primer_dia.strftime('%d/%m/%Y')})</i>")
+    return lineas
 
 
 def calcular_medias_mes(dias):
@@ -527,16 +573,16 @@ def registrar_medias(stats, anio, mes):
     exportar_csv(ws, MEDIAS_CSV_PATH)
 
 
-NOMBRES_MES = [
-    "", "enero", "febrero", "marzo", "abril", "mayo", "junio",
-    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
-]
-
-
-def construir_mensaje_mensual(stats, anio, mes):
+def construir_mensaje_mensual(stats, anio, mes, dias_todos=None, en_curso_hasta=None):
+    """Texto del resumen mensual. Si se pasa dias_todos (hoja Diario completa)
+    se añade el desglose de lluvia del año hidrológico. en_curso_hasta marca
+    un mes todavía sin terminar (último día registrado)."""
     nombre = NOMBRES_MES[mes].capitalize()
+    titulo = f"📊 <b>Resumen mensual — {nombre} {anio}</b>"
+    if en_curso_hasta:
+        titulo += f"\n<i>Mes en curso, datos hasta el {en_curso_hasta.strftime('%d/%m')}</i>"
     lineas = [
-        f"📊 <b>Resumen mensual — {nombre} {anio}</b>",
+        titulo,
         f"({stats['dias']} días con datos)",
         "",
         f"🌡 Media de máximas: <b>{_fmt(stats['media_max'], '°C')}</b>",
@@ -549,8 +595,8 @@ def construir_mensaje_mensual(stats, anio, mes):
         f"💨 Media de rachas: <b>{_fmt(stats['media_racha'], ' km/h')}</b>",
         f"🌪 Racha máxima: <b>{_fmt(stats['racha_abs'], ' km/h')}</b>"
         + (f" ({stats['fecha_racha'].strftime('%d/%m')})" if stats["fecha_racha"] else ""),
-        f"🌧 Lluvia total: <b>{stats['lluvia_total']:.1f} mm</b> "
-        f"({stats['dias_lluvia']} días de lluvia)",
+        f"🌧 Lluvia del mes: <b>{stats['lluvia_total']:.1f} L/m²</b> "
+        f"({stats['dias_lluvia']} {'día' if stats['dias_lluvia'] == 1 else 'días'} de lluvia)",
         f"🔵 Presión media: <b>{_fmt(stats['media_presion'], ' hPa')}</b>",
         f"💧 Humedad media: {_fmt(stats['media_hum_min'], '%')} – {_fmt(stats['media_hum_max'], '%')}",
     ]
@@ -558,7 +604,30 @@ def construir_mensaje_mensual(stats, anio, mes):
         lineas.append(f"☀️ Media radiación máx: <b>{_fmt(stats['media_solar'], ' W/m²')}</b>")
     if stats["media_uv"] is not None:
         lineas.append(f"🕶 Media UV máx: <b>{_fmt(stats['media_uv'])}</b>")
+
+    if dias_todos:
+        hidro = bloque_lluvia_hidro(anio, mes, dias_todos, hasta=en_curso_hasta)
+        if hidro:
+            lineas += [""] + hidro
     return "\n".join(lineas)
+
+
+def resumen_mensual(anio, mes, hoy=None, dias_todos=None):
+    """Resumen de cualquier mes calculado al vuelo desde la hoja Diario.
+    Devuelve (texto, stats) o (None, None) si no hay días de ese mes.
+    Lo usan el modo 'mensual' y el listener (/mensual, /mes)."""
+    hoy = hoy or date.today()
+    dias_todos = leer_diario() if dias_todos is None else dias_todos
+    dias = leer_dias_del_mes(anio, mes, dias_todos)
+    if not dias:
+        return None, None
+    stats = calcular_medias_mes(dias)
+    en_curso = (anio, mes) == (hoy.year, hoy.month)
+    ultimo = max(d["fecha"] for d in dias)
+    texto = construir_mensaje_mensual(
+        stats, anio, mes, dias_todos, en_curso_hasta=ultimo if en_curso else None
+    )
+    return texto, stats
 
 
 def ejecutar_mensual(hoy):
@@ -567,8 +636,8 @@ def ejecutar_mensual(hoy):
     anio, mes = ultimo_dia_mes_anterior.year, ultimo_dia_mes_anterior.month
     log.info("Calculando medias de %02d/%d", mes, anio)
 
-    dias = leer_dias_del_mes(anio, mes)
-    if not dias:
+    texto, stats = resumen_mensual(anio, mes, hoy)
+    if not stats:
         log.warning("No hay días registrados para %02d/%d", mes, anio)
         enviar_telegram(
             f"⚠️ <b>Bot Meteo</b>: no hay datos registrados de "
@@ -576,9 +645,8 @@ def ejecutar_mensual(hoy):
         )
         return
 
-    stats = calcular_medias_mes(dias)
     registrar_medias(stats, anio, mes)
-    enviar_telegram(construir_mensaje_mensual(stats, anio, mes))
+    enviar_telegram(texto)
     subir_a_github(hoy, f"Medias mensuales {mes:02d}/{anio}")
 
 
@@ -631,7 +699,7 @@ def guardar_snapshot(resumen, hoy):
         log.warning("No se pudo guardar el snapshot: %s", e)
 
 
-def novedades_desde_snapshot(resumen, hoy, total_hidro=None):
+def novedades_desde_snapshot(resumen, hoy, total_hidro=None, total_mes=None):
     """Compara el día completo con la foto de las 21:00.
     Devuelve lista de líneas si llovió más o el viento superó la racha."""
     if not SNAPSHOT_PATH.exists():
@@ -655,10 +723,10 @@ def novedades_desde_snapshot(resumen, hoy, total_hidro=None):
             f"🌧 Lluvia: <b>{lluvia_final:.1f} mm</b> en el día "
             f"(+{delta:.1f} mm desde las 21:00)"
         )
-        # El acumulado anual dado a las 21:00 ha cambiado: se actualiza
-        linea = linea_hidro(total_hidro, hoy)
-        if linea:
-            lineas.append(linea)
+        # Los acumulados dados a las 21:00 han cambiado: se actualizan
+        for linea in (linea_mes(total_mes, hoy), linea_hidro(total_hidro, hoy)):
+            if linea:
+                lineas.append(linea)
 
     racha_2100 = snap.get("racha_max")
     racha_final = resumen["racha_max"]
@@ -676,7 +744,7 @@ def _fmt(valor, unidad=""):
     return f"{valor:.1f}{unidad}" if valor is not None else "n/d"
 
 
-def construir_mensaje(resumen, batidos, hoy, total_hidro=None):
+def construir_mensaje(resumen, batidos, hoy, total_hidro=None, total_mes=None):
     lineas = [
         f"🌦 <b>Resumen meteo — {hoy.strftime('%d/%m/%Y')}</b>",
         "",
@@ -686,9 +754,9 @@ def construir_mensaje(resumen, batidos, hoy, total_hidro=None):
     ]
     if resumen["lluvia"] and resumen["lluvia"] > 0:
         lineas.append(f"🌧 Lluvia: <b>{resumen['lluvia']:.1f} mm</b>")
-    linea = linea_hidro(total_hidro, hoy)
-    if linea:
-        lineas.append(linea)
+    for linea in (linea_mes(total_mes, hoy), linea_hidro(total_hidro, hoy)):
+        if linea:
+            lineas.append(linea)
     lineas.append(
         f"🔵 Presión: <b>{_fmt(resumen['presion_min'])} – {_fmt(resumen['presion_max'])} hPa</b>"
     )
@@ -774,22 +842,25 @@ def main():
 
     if modo == "resumen":
         # 21:00 — mensaje informativo + foto de lluvia/viento para comparar luego
-        # Acumulado hidrológico: días ya registrados + lo que lleva hoy
-        total_hidro = lluvia_acumulada_hidro(hoy, incluir_hoy=False)
+        # Acumulados de mes y año hidrológico: días ya registrados + lo que lleva hoy
+        total_mes, total_hidro = acumulados_lluvia(hoy, incluir_hoy=False)
+        hoy_mm = resumen["lluvia"] or 0.0
+        if total_mes is not None:
+            total_mes += hoy_mm
         if total_hidro is not None:
-            total_hidro += resumen["lluvia"] or 0.0
-        enviar_telegram(construir_mensaje(resumen, [], hoy, total_hidro))
+            total_hidro += hoy_mm
+        enviar_telegram(construir_mensaje(resumen, [], hoy, total_hidro, total_mes))
         guardar_snapshot(resumen, hoy)
     else:
         # 23:57 — registro definitivo del día completo, sin despertar a nadie
         batidos = comprobar_records(resumen, hoy)
         registrar_en_excel(resumen, batidos, hoy)
-        total_hidro = lluvia_acumulada_hidro(hoy, incluir_hoy=True)
-        log.info("Lluvia año hidrológico: %s mm", total_hidro)
+        total_mes, total_hidro = acumulados_lluvia(hoy, incluir_hoy=True)
+        log.info("Lluvia mes: %s mm / año hidrológico: %s mm", total_mes, total_hidro)
 
         bloques = []
 
-        novedades = novedades_desde_snapshot(resumen, hoy, total_hidro)
+        novedades = novedades_desde_snapshot(resumen, hoy, total_hidro, total_mes)
         if novedades:
             bloques.append(
                 "\n".join([f"🌙 <b>Novedades desde las 21:00 — {hoy.strftime('%d/%m/%Y')}</b>"]
