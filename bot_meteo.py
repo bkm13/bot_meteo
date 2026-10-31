@@ -94,32 +94,29 @@ CABECERA_MENSUAL = [
 # Descarga y cálculo
 # ---------------------------------------------------------------------------
 def descargar_observaciones():
-    """Lee las observaciones del día desde el archivo local generado en la Raspberry Pi.
-       Si no existe localmente, intenta tirar de la API como respaldo."""
-    archivo_local = BASE_DIR / "observaciones_hoy.json"
+    """Descarga las observaciones del día desde el JSON sincronizado en GitHub."""
+    url_github = "https://raw.githubusercontent.com/TU_USUARIO/TU_REPO/main/observaciones_hoy.json"
     
-    # 1. Intentar leer de la Raspberry Pi en local
-    if archivo_local.exists():
-        try:
-            datos = json.loads(archivo_local.read_text(encoding="utf-8"))
-            if datos:
-                log.info("Cargadas %d observaciones desde el almacenamiento local de la Pi", len(datos))
-                return datos
-        except Exception as e:
-            log.warning("No se pudo leer el archivo local de observaciones: %s", e)
-
-    # 2. Respaldo: Si falla lo local, intenta la API externa habitual
-    log.warning("Archivo local no disponible. Intentando descarga externa (WU)...")
-    url = WU_URL.format(station=WU_STATION_ID, key=WU_API_KEY)
     for intento in range(3):
         try:
-            r = requests.get(url, timeout=30)
+            r = requests.get(url_github, timeout=30)
             r.raise_for_status()
-            obs = r.json().get("observations", [])
+            obs = r.json()
             if obs:
+                log.info("Cargadas %d observaciones desde GitHub", len(obs))
                 return obs
         except Exception as e:
-            log.warning("Error descargando WU (intento %d): %s", intento + 1, e)
+            log.warning("Error descargando JSON de GitHub (intento %d): %s", intento + 1, e)
+            
+    # Respaldo final por si GitHub falla: la API oficial de Weather Underground
+    log.warning("Usando respaldo de la API de Weather Underground...")
+    url_wu = WU_URL.format(station=WU_STATION_ID, key=WU_API_KEY)
+    try:
+        r = requests.get(url_wu, timeout=30)
+        r.raise_for_status()
+        return r.json().get("observations", [])
+    except Exception as e:
+        log.error("Fallo total al obtener observaciones: %s", e)
     return None
 
 
