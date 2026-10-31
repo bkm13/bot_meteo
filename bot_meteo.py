@@ -94,7 +94,22 @@ CABECERA_MENSUAL = [
 # Descarga y cálculo
 # ---------------------------------------------------------------------------
 def descargar_observaciones():
-    """Descarga todas las observaciones del día. Devuelve lista o None."""
+    """Lee las observaciones del día desde el archivo local generado en la Raspberry Pi.
+       Si no existe localmente, intenta tirar de la API como respaldo."""
+    archivo_local = BASE_DIR / "observaciones_hoy.json"
+    
+    # 1. Intentar leer de la Raspberry Pi en local
+    if archivo_local.exists():
+        try:
+            datos = json.loads(archivo_local.read_text(encoding="utf-8"))
+            if datos:
+                log.info("Cargadas %d observaciones desde el almacenamiento local de la Pi", len(datos))
+                return datos
+        except Exception as e:
+            log.warning("No se pudo leer el archivo local de observaciones: %s", e)
+
+    # 2. Respaldo: Si falla lo local, intenta la API externa habitual
+    log.warning("Archivo local no disponible. Intentando descarga externa (WU)...")
     url = WU_URL.format(station=WU_STATION_ID, key=WU_API_KEY)
     for intento in range(3):
         try:
@@ -103,7 +118,6 @@ def descargar_observaciones():
             obs = r.json().get("observations", [])
             if obs:
                 return obs
-            log.warning("Respuesta sin observaciones (intento %d)", intento + 1)
         except Exception as e:
             log.warning("Error descargando WU (intento %d): %s", intento + 1, e)
     return None
