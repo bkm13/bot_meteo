@@ -95,7 +95,7 @@ CABECERA_MENSUAL = [
 # ---------------------------------------------------------------------------
 def descargar_observaciones():
     """Descarga las observaciones del día desde el JSON sincronizado en GitHub."""
-    url_github = "https://raw.githubusercontent.com/TU_USUARIO/TU_REPO/main/observaciones_hoy.json"
+    url_github = "https://raw.githubusercontent.com/bkm13/bot_meteo/main/observaciones_hoy.json"
     
     for intento in range(3):
         try:
