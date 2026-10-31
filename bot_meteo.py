@@ -94,31 +94,38 @@ CABECERA_MENSUAL = [
 # Descarga y cálculo
 # ---------------------------------------------------------------------------
 def descargar_observaciones():
-    """Descarga las observaciones del día desde el JSON sincronizado en GitHub."""
+    """Descarga las observaciones intentando primero la Pi vía GitHub.
+       Si la Pi está rota o no actualiza, recurre automáticamente a Weather Underground."""
+    
     url_github = "https://raw.githubusercontent.com/bkm13/bot_meteo/main/observaciones_hoy.json"
     
-    for intento in range(3):
-        try:
-            r = requests.get(url_github, timeout=30)
-            r.raise_for_status()
+    # 1. Intentar leer los datos locales procesados por la Raspberry Pi
+    try:
+        r = requests.get(url_github, timeout=10)
+        if r.status_code == 200:
             obs = r.json()
             if obs:
-                log.info("Cargadas %d observaciones desde GitHub", len(obs))
+                # Opcional: Validar que el archivo no esté obsoleto (ej. última lectura reciente)
+                log.info("Datos obtenidos correctamente desde la Raspberry Pi (GitHub)")
                 return obs
-        except Exception as e:
-            log.warning("Error descargando JSON de GitHub (intento %d): %s", intento + 1, e)
-            
-    # Respaldo final por si GitHub falla: la API oficial de Weather Underground
-    log.warning("Usando respaldo de la API de Weather Underground...")
-    url_wu = WU_URL.format(station=WU_STATION_ID, key=WU_API_KEY)
-    try:
-        r = requests.get(url_wu, timeout=30)
-        r.raise_for_status()
-        return r.json().get("observations", [])
     except Exception as e:
-        log.error("Fallo total al obtener observaciones: %s", e)
-    return None
+        log.warning("La Raspberry Pi / GitHub no responde o falló: %s", e)
 
+    # 2. Plan B: Si la Pi se ha roto o no hay conexión, tirar de la API oficial directamente
+    log.warning("⚠️ Alerta: Raspberry Pi inaccesible. Activando respaldo externo de Weather Underground...")
+    url_wu = WU_URL.format(station=WU_STATION_ID, key=WU_API_KEY)
+    
+    try:
+        r = requests.get(url_wu, timeout=15)
+        r.raise_for_status()
+        datos_wu = r.json().get("observations", [])
+        if datos_wu:
+            log.info("Datos recuperados con éxito mediante el respaldo de Weather Underground.")
+            return datos_wu
+    except Exception as e:
+        log.error("Fallo crítico: Tampoco se pudo conectar con Weather Underground: %s", e)
+        
+    return None
 
 def _hora(obs):
     """Extrae HH:MM de obsTimeLocal ('2026-08-06 14:35:00')."""
