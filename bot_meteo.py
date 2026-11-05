@@ -27,6 +27,7 @@ import json
 import logging
 import subprocess
 import calendar
+from html import escape
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
@@ -89,101 +90,75 @@ CABECERA_MENSUAL = [
     "Media Humedad Máx (%)", "Media Humedad Mín (%)",
     "Media Radiación Máx (W/m²)", "Media UV Máx",
 ]
-# Variables globales para control de alertas y evitar spam
-_alerta_enviada = False
-def enviar_alerta_telegram(mensaje):
-    """Envía un aviso proactivo a tu Telegram si la Pi muere."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "TU_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "TU_CHAT_ID")
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": chat_id, "text": mensaje, "parse_mode": "Markdown"}, timeout=10)
-    except Exception as e:
-        print(f"Error enviando alerta: {e}")
-
-def verificar_salud_y_descargar():
-    """Descarga de GitHub, vigila la salud de la Pi y activa respaldos si falla."""
-    global _alerta_enviada
-    url_github = "https://raw.githubusercontent.com/bkm13/bot_meteo/main/observaciones_hoy.json"
-    
-    # 1. Intentar leer los datos procesados por la Raspberry Pi vía GitHub
-    try:
-        r = requests.get(url_github, timeout=10)
-        if r.status_code == 200:
-            obs = r.json()
-            if obs:
-                # Comprobar la antigüedad de la última lectura para ver si la Pi sigue viva
-                ultima_obs = obs[-1]
-                fecha_str = ultima_obs.get("date") # Ajusta al campo de fecha real de tu JSON
-                
-                if fecha_str:
-                    tiempo_lectura = datetime.strptime(fecha_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                    if datetime.now(timezone.utc) - tiempo_lectura > timedelta(hours=2):
-                        if not _alerta_enviada:
-                            enviar_alerta_telegram(
-                                "🚨 **¡ALERTA DE SISTEMA!**\n\n"
-                                f"La Raspberry Pi lleva más de 2 horas sin actualizar los datos.\n"
-                                f"Última lectura: `{fecha_str}`.\n"
-                                "⚠️ *Posible fallo de hardware, tarjeta SD o red.*"
-                            )
-                            _alerta_enviada = True
-                    else:
-                        if _alerta_enviada:
-                            enviar_alerta_telegram("✅ **¡Sistema recuperado!** La Raspberry Pi ha vuelto a enviar datos.")
-                            _alerta_enviada = False
-                            
-                return obs
-    except Exception as e:
-        print(f"No se pudo conectar con GitHub: {e}")
-
-    # 2. Plan B: Si la Pi ha muerto o GitHub falla, usar Weather Underground directamente
-    print("⚠️ Pi inaccesible. Usando respaldo de Weather Underground...")
-    url_wu = WU_URL.format(station=IMONTE1305, key=ElJt9IYx)
-    try:
-        r = requests.get(url_wu, timeout=15)
-        r.raise_for_status()
-        return r.json().get("observations", [])
-    except Exception as e:
-        print(f"Fallo crítico en el respaldo de WU: {e}")
-        
-    return None
-
 # ---------------------------------------------------------------------------
 # Descarga y cálculo
 # ---------------------------------------------------------------------------
-def descargar_observaciones():
-    """Descarga las observaciones intentando primero la Pi vía GitHub.
-       Si la Pi está rota o no actualiza, recurre automáticamente a Weather Underground."""
-    
-    url_github = "https://raw.githubusercontent.com/bkm13/bot_meteo/main/observaciones_hoy.json"
-    
-    # 1. Intentar leer los datos locales procesados por la Raspberry Pi
-    try:
-        r = requests.get(url_github, timeout=10)
-        if r.status_code == 200:
-            obs = r.json()
-            if obs:
-                # Opcional: Validar que el archivo no esté obsoleto (ej. última lectura reciente)
-                log.info("Datos obtenidos correctamente desde la Raspberry Pi (GitHub)")
-                return obs
-    except Exception as e:
-        log.warning("La Raspberry Pi / GitHub no responde o falló: %s", e)
+URL_PI = "https://raw.githubusercontent.com/bkm13/bot_meteo/main/observaciones_hoy.json"
 
-    # 2. Plan B: Si la Pi se ha roto o no hay conexión, tirar de la API oficial directamente
-    log.warning("⚠️ Alerta: Raspberry Pi inaccesible. Activando respaldo externo de Weather Underground...")
-    url_wu = WU_URL.format(station=WU_STATION_ID, key=WU_API_KEY)
-    
+
+def _leer_wu():
+    """Observaciones de Weather Underground (3 reintentos). Lista vacía si falla."""
+    url = WU_URL.format(station=WU_STATION_ID, key=WU_API_KEY)
+    for intento in range(3):
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            obs = r.json().get("observations", [])
+            if obs:
+                return obs
+            log.warning("WU sin observaciones (intento %d)", intento + 1)
+        except Exception as e:
+            log.warning("Error descargando WU (intento %d): %s", intento + 1, e)
+    return []
+
+
+def _leer_pi(hoy):
+    """Observaciones de hoy guardadas por la Raspberry Pi (vía GitHub).
+    Lista vacía si no hay o son de otro día (nunca se mezclan datos viejos)."""
     try:
-        r = requests.get(url_wu, timeout=15)
-        r.raise_for_status()
-        datos_wu = r.json().get("observations", [])
-        if datos_wu:
-            log.info("Datos recuperados con éxito mediante el respaldo de Weather Underground.")
-            return datos_wu
+        r = requests.get(URL_PI, timeout=15)
+        if r.status_code != 200:
+            log.warning("Pi/GitHub respondió %s", r.status_code)
+            return []
+        datos = r.json()
+        if isinstance(datos, dict):
+            datos = datos.get("observations", [])
+        if not isinstance(datos, list):
+            return []
+        prefijo = hoy.isoformat()
+        return [o for o in datos
+                if isinstance(o, dict) and str(o.get("obsTimeLocal", "")).startswith(prefijo)]
     except Exception as e:
-        log.error("Fallo crítico: Tampoco se pudo conectar con Weather Underground: %s", e)
-        
-    return None
+        log.warning("Pi/GitHub no responde: %s", e)
+        return []
+
+
+def descargar_observaciones():
+    """Une las observaciones de Weather Underground y de la Raspberry Pi.
+    La Pi guarda los datos en casa aunque no haya internet, así que rellena
+    los huecos que WU no recibió. Si coinciden en la misma hora se usa la de WU.
+    Si solo responde una fuente, se usa esa. Devuelve lista o None."""
+    hoy = date.today()
+    wu = _leer_wu()
+    pi = _leer_pi(hoy)
+
+    horas_wu = {o.get("obsTimeLocal") for o in wu}
+    n_pi_solo = sum(1 for o in pi if o.get("obsTimeLocal") not in horas_wu)
+
+    por_hora = {o.get("obsTimeLocal", i): o for i, o in enumerate(pi)}
+    por_hora.update({o.get("obsTimeLocal", f"wu{i}"): o for i, o in enumerate(wu)})  # WU manda
+
+    obs = sorted(por_hora.values(), key=lambda o: str(o.get("obsTimeLocal", "")))
+    log.info("Observaciones: WU=%d, Pi=%d, aportadas solo por la Pi=%d, total=%d",
+             len(wu), len(pi), n_pi_solo, len(obs))
+    if not wu and pi:
+        log.warning("WU no disponible: se usan solo los datos de la Pi")
+    if wu and not pi:
+        log.warning("Sin datos de hoy en la Pi: se usa solo WU")
+    return obs or None
+
+
+
 
 def _hora(obs):
     """Extrae HH:MM de obsTimeLocal ('2026-08-06 14:35:00')."""
@@ -876,8 +851,14 @@ def ejecutar_mensual(hoy):
 # ---------------------------------------------------------------------------
 # Sincronización con GitHub
 # ---------------------------------------------------------------------------
+def _git(base, *args, timeout=120):
+    return subprocess.run(base + list(args), capture_output=True, text=True, timeout=timeout)
+
+
 def subir_a_github(hoy, mensaje=None):
-    """Commit y push de los ficheros de datos. Si falla, solo lo registra."""
+    """Commit y push de los datos. Antes del push integra lo que haya en GitHub
+    (merge; ante conflicto ganan los datos de la VM). Si main no se puede
+    actualizar, sube una copia a la rama backup-datos y avisa por Telegram."""
     archivos = [
         "registro_meteo.xlsx", "registro_diario.csv", "records.csv", "records.json",
         "medias_mensuales.xlsx", "medias_mensuales.csv",
@@ -886,21 +867,44 @@ def subir_a_github(hoy, mensaje=None):
     mensaje = mensaje or f"Registro diario {hoy.strftime('%d/%m/%Y')}"
     base = ["git", "-C", str(BASE_DIR),
             "-c", "user.name=bot-meteo", "-c", "user.email=bot-meteo@vm"]
+    error = ""
     try:
-        subprocess.run(base + ["add"] + existentes, check=True, capture_output=True, timeout=60)
-        commit = subprocess.run(
-            base + ["commit", "-m", mensaje],
-            capture_output=True, text=True, timeout=60,
-        )
-        if commit.returncode != 0:
-            if "nothing to commit" in (commit.stdout + commit.stderr):
-                log.info("Sin cambios que subir a GitHub")
-                return
-            raise RuntimeError(commit.stderr.strip() or commit.stdout.strip())
-        subprocess.run(base + ["push"], check=True, capture_output=True, timeout=120)
-        log.info("Datos subidos a GitHub")
+        r = _git(base, "add", *existentes, timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError(f"add: {r.stderr.strip()}")
+
+        r = _git(base, "commit", "-m", mensaje, timeout=60)
+        if r.returncode != 0 and "nothing to commit" not in (r.stdout + r.stderr):
+            raise RuntimeError(f"commit: {(r.stderr or r.stdout).strip()}")
+        # Sin return aquí: puede haber commits antiguos pendientes de subir
+
+        r = _git(base, "pull", "--no-rebase", "--no-edit", "-X", "ours", "origin", "main")
+        if r.returncode != 0:
+            _git(base, "merge", "--abort")
+            error = f"pull: {(r.stderr or r.stdout).strip()[:300]}"
+        else:
+            r = _git(base, "push", "origin", "main")
+            if r.returncode == 0:
+                log.info("Datos subidos a GitHub")
+                return True
+            error = f"push: {r.stderr.strip()[:300]}"
     except Exception as e:
-        log.warning("No se pudo subir a GitHub (el bot sigue funcionando): %s", e)
+        error = str(e)[:300]
+
+    log.warning("Fallo subiendo a main: %s", error)
+    try:
+        r = _git(base, "push", "--force", "origin", "HEAD:refs/heads/backup-datos")
+        copia = ("copia subida a la rama backup-datos" if r.returncode == 0
+                 else f"TAMBIÉN falló backup-datos: {r.stderr.strip()[:200]}")
+    except Exception as e:
+        copia = f"sin copia en GitHub ({e})"
+    enviar_telegram(
+        f"⚠️ <b>Bot Meteo</b>: no se pudo subir a main ({hoy.strftime('%d/%m/%Y')}).\n"
+        f"{escape(copia)}\n<code>{escape(error)}</code>",
+        silencioso=True,
+    )
+    return False
+
 
 
 # ---------------------------------------------------------------------------
