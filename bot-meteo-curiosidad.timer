@@ -1,0 +1,10 @@
+[Unit]
+Description=Bot Meteo - curiosidad de lluvia una vez al dia a hora aleatoria entre 11:00 y 19:00 (hora de Madrid)
+
+[Timer]
+OnCalendar=*-*-* 11:00:00 Europe/Madrid
+RandomizedDelaySec=8h
+Persistent=false
+
+[Install]
+WantedBy=timers.target

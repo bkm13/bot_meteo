@@ -6,6 +6,12 @@ Modos de ejecución (systemd timers):
   resumen   21:00  - Mensaje informativo del día + snapshot de lluvia/viento
   registro  23:57  - Registro definitivo del día (Excel, récords, GitHub), silencioso
   mensual   día 1  - Medias del mes anterior en medias_mensuales.xlsx + GitHub
+  curiosidad        - De vez en cuando, un dato curioso de la serie de lluvia
+                      desde 1993 (curiosidad forzar = enviar siempre)
+
+La serie histórica de lluvia (lluvia_historica.csv, desde 01/10/1993) se une
+al registro de la estación en lluvia_historica.py. Con ella, los días y meses
+de lluvia se comparan con la historia ("lo mismo que el 03/05/2007"...).
 
 El resumen de las 21:00 incluye la lluvia acumulada del mes en curso y la del
 año hidrológico (1 de septiembre – 31 de agosto), calculadas sumando la hoja
@@ -24,6 +30,7 @@ import os
 import sys
 import csv
 import json
+import random
 import logging
 import subprocess
 import calendar
@@ -33,6 +40,8 @@ from pathlib import Path
 
 import requests
 from openpyxl import Workbook, load_workbook
+
+import lluvia_historica as lh
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +55,9 @@ MEDIAS_XLSX_PATH = BASE_DIR / "medias_mensuales.xlsx"
 MEDIAS_CSV_PATH = BASE_DIR / "medias_mensuales.csv"
 RECORDS_PATH = BASE_DIR / "records.json"
 SNAPSHOT_PATH = BASE_DIR / "snapshot_2100.json"
+CURIOSIDADES_PATH = BASE_DIR / "curiosidades_enviadas.json"
+# Probabilidad de enviar curiosidad cada vez que salta el timer (1 vez al día)
+CURIOSIDAD_PROB = float(os.environ.get("CURIOSIDAD_PROB", "0.5"))
 LOG_PATH = BASE_DIR / "bot_meteo.log"
 
 WU_API_KEY = os.environ.get("WU_API_KEY", "")
@@ -575,7 +587,7 @@ def acumulados_lluvia(hoy, incluir_hoy=True):
     Devuelve (total_mes, total_hidro), o (None, None) si falla la lectura.
     Se calcula desde el Excel, así que re-ejecutar un día no duplica la suma."""
     try:
-        dias = leer_diario()
+        dias = dias_lluvia_completos(leer_diario())
     except Exception as e:
         log.warning("No se pudo leer la hoja Diario para la lluvia acumulada: %s", e)
         return None, None
@@ -583,6 +595,17 @@ def acumulados_lluvia(hoy, incluir_hoy=True):
     total_mes = _suma_lluvia(dias, hoy.replace(day=1), hoy, incluir_hoy)
     total_hidro = _suma_lluvia(dias, inicio_hidro, hoy, incluir_hoy)
     return total_mes, total_hidro
+
+
+def dias_lluvia_completos(dias_diario):
+    """Días de la hoja Diario + serie histórica (manda la estación), con el
+    formato de leer_diario() en lo que toca a la lluvia ('fecha', 'lluvia')."""
+    try:
+        serie = lh.cargar_serie(dias_diario)
+    except Exception as e:
+        log.warning("No se pudo leer la serie histórica de lluvia: %s", e)
+        return dias_diario
+    return [{"fecha": d, "lluvia": v} for d, v in serie.conocidos]
 
 
 def lluvia_acumulada_hidro(hoy, incluir_hoy=True):
@@ -609,6 +632,7 @@ def bloque_lluvia_hidro(anio, mes, dias, hasta=None):
     (o hasta 'hasta' si el mes está en curso)."""
     fin = hasta or date(anio, mes, calendar.monthrange(anio, mes)[1])
     inicio, etiqueta = anio_hidrologico(fin)
+    dias = dias_lluvia_completos(dias)
     del_periodo = [d for d in dias if inicio <= d["fecha"] <= fin]
     if not del_periodo:
         return []
@@ -825,7 +849,27 @@ def resumen_mensual(anio, mes, hoy=None, dias_todos=None):
     texto = construir_mensaje_mensual(
         stats, anio, mes, dias_todos, en_curso_hasta=ultimo if en_curso else None
     )
+    historia = bloque_historia_mes(anio, mes, dias_todos, en_curso)
+    if historia:
+        texto += "\n\n" + historia
     return texto, stats
+
+
+def bloque_historia_mes(anio, mes, dias_todos, en_curso=False):
+    """Comparación del mes con la serie de lluvia desde 1993."""
+    try:
+        serie = lh.cargar_serie(dias_todos)
+        p = serie.meses().get((anio, mes))
+        if not p or not p["con_dato"]:
+            return ""
+        lineas = lh.comparar_mes(serie, p["total"], anio, mes, en_curso=en_curso)
+        if not lineas:
+            return ""
+        return "\n".join([f"📜 <b>{NOMBRES_MES[mes].capitalize()} en la historia</b> "
+                          f"(desde {serie.inicio.year})"] + lineas)
+    except Exception as e:
+        log.warning("No se pudo comparar el mes con la serie histórica: %s", e)
+        return ""
 
 
 def ejecutar_mensual(hoy):
@@ -844,6 +888,15 @@ def ejecutar_mensual(hoy):
         return
 
     registrar_medias(stats, anio, mes)
+    # Al acabar diciembre (año natural) o agosto (año hidrológico): balance
+    try:
+        if mes in (8, 12):
+            serie = lh.cargar_serie(leer_diario())
+            cierre = lh.cierre_periodo(serie, anio - 1 if mes == 8 else anio, hidro=(mes == 8))
+            if cierre:
+                texto += "\n\n" + "\n".join(cierre)
+    except Exception as e:
+        log.warning("No se pudo calcular el cierre anual: %s", e)
     enviar_telegram(texto, teclado=teclado_lluvia(anio, mes))
     subir_a_github(hoy, f"Medias mensuales {mes:02d}/{anio}")
 
@@ -861,7 +914,7 @@ def subir_a_github(hoy, mensaje=None):
     actualizar, sube una copia a la rama backup-datos y avisa por Telegram."""
     archivos = [
         "registro_meteo.xlsx", "registro_diario.csv", "records.csv", "records.json",
-        "medias_mensuales.xlsx", "medias_mensuales.csv",
+        "medias_mensuales.xlsx", "medias_mensuales.csv", "lluvia_historica.csv",
     ]
     existentes = [a for a in archivos if (BASE_DIR / a).exists()]
     mensaje = mensaje or f"Registro diario {hoy.strftime('%d/%m/%Y')}"
@@ -975,6 +1028,28 @@ def _fmt(valor, unidad=""):
     return f"{valor:.1f}{unidad}" if valor is not None else "n/d"
 
 
+def bloque_historia_dia(mm, hoy, con_mes=True):
+    """'En la historia': comparación de la lluvia de hoy (y del mes) con la
+    serie desde 1993. Solo si hoy ha llovido al menos 1 L/m²."""
+    if not mm or mm < 1:
+        return ""
+    try:
+        serie = lh.cargar_serie([d for d in leer_diario() if d["fecha"] != hoy])
+        lineas = lh.comparar_dia(serie, mm, hoy)
+        if con_mes:
+            mes = serie.periodo(hoy.replace(day=1), hoy - timedelta(days=1))["total"] + mm
+            lineas += [l for l in lh.comparar_mes(serie, mes, hoy.year, hoy.month, en_curso=True)
+                       if not l.startswith("📊")]
+            hidro = serie.periodo(lh.inicio_hidro(hoy), hoy - timedelta(days=1))["total"] + mm
+            lineas += lh.comparar_hidro(serie, hidro, hoy, corto=True)
+        if not lineas:
+            return ""
+        return "\n".join([f"📜 <b>En la historia</b> (desde {serie.inicio.year})"] + lineas)
+    except Exception as e:
+        log.warning("No se pudo comparar con la serie histórica: %s", e)
+        return ""
+
+
 def construir_mensaje(resumen, batidos, hoy, total_hidro=None, total_mes=None):
     lineas = [
         f"🌦 <b>Resumen meteo — {hoy.strftime('%d/%m/%Y')}</b>",
@@ -1038,6 +1113,35 @@ def enviar_telegram(texto, silencioso=False, teclado=None):
 
 
 # ---------------------------------------------------------------------------
+# Curiosidades (modo "curiosidad")
+# ---------------------------------------------------------------------------
+def ejecutar_curiosidad(hoy, forzar=False):
+    """Envía un dato curioso de la serie de lluvia. El timer salta una vez al
+    día a una hora aleatoria y se envía con probabilidad CURIOSIDAD_PROB, así
+    que llegan 'de vez en cuando'. No repite una curiosidad en 60 días."""
+    if not forzar and random.random() > CURIOSIDAD_PROB:
+        log.info("Hoy no toca curiosidad")
+        return
+    try:
+        enviadas = json.loads(CURIOSIDADES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        enviadas = []
+    limite = (hoy - timedelta(days=60)).isoformat()
+    enviadas = [e for e in enviadas if e.get("fecha", "") >= limite]
+
+    serie = lh.cargar_serie(leer_diario())
+    res = lh.curiosidad_aleatoria(serie, hoy, excluir={e["clave"] for e in enviadas})
+    if not res:
+        log.info("No hay curiosidad disponible")
+        return
+    clave, texto = res
+    if enviar_telegram(f"🤓 <b>¿Sabías que…?</b>\n\n{texto}"):
+        enviadas.append({"clave": clave, "fecha": hoy.isoformat()})
+        CURIOSIDADES_PATH.write_text(json.dumps(enviadas, ensure_ascii=False, indent=1),
+                                     encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -1051,14 +1155,19 @@ def main():
         log.error("Faltan variables de entorno: %s", ", ".join(faltan))
         sys.exit(1)
 
-    # Modos: "resumen" (21:00), "registro" (23:57, silencioso), "mensual" (día 1)
+    # Modos: "resumen" (21:00), "registro" (23:57, silencioso), "mensual" (día 1),
+    # "curiosidad" (una vez al día, a veces)
     modo = sys.argv[1] if len(sys.argv) > 1 else "resumen"
-    if modo not in ("resumen", "registro", "mensual"):
-        log.error("Modo desconocido: %s (usa 'resumen', 'registro' o 'mensual')", modo)
+    if modo not in ("resumen", "registro", "mensual", "curiosidad"):
+        log.error("Modo desconocido: %s (usa 'resumen', 'registro', 'mensual' o 'curiosidad')", modo)
         sys.exit(1)
 
     hoy = date.today()
     log.info("=== Ejecución diaria %s (modo: %s) ===", hoy.isoformat(), modo)
+
+    if modo == "curiosidad":
+        ejecutar_curiosidad(hoy, forzar="forzar" in sys.argv[2:])
+        return
 
     if modo == "mensual":
         # No necesita descargar nada: trabaja sobre el registro ya guardado
@@ -1086,7 +1195,11 @@ def main():
             total_mes += hoy_mm
         if total_hidro is not None:
             total_hidro += hoy_mm
-        enviar_telegram(construir_mensaje(resumen, [], hoy, total_hidro, total_mes))
+        texto = construir_mensaje(resumen, [], hoy, total_hidro, total_mes)
+        historia = bloque_historia_dia(resumen["lluvia"], hoy)
+        if historia:
+            texto += "\n\n" + historia
+        enviar_telegram(texto)
         guardar_snapshot(resumen, hoy)
     else:
         # 23:57 — registro definitivo del día completo, sin despertar a nadie
@@ -1098,6 +1211,11 @@ def main():
         bloques = []
 
         novedades = novedades_desde_snapshot(resumen, hoy, total_hidro, total_mes)
+        if novedades and any(l.startswith("🌧") for l in novedades):
+            # Ha seguido lloviendo tras las 21:00: comparación con el total final
+            historia = bloque_historia_dia(resumen["lluvia"], hoy, con_mes=False)
+            if historia:
+                novedades += historia.split("\n")[1:]
         if novedades:
             bloques.append(
                 "\n".join([f"🌙 <b>Novedades desde las 21:00 — {hoy.strftime('%d/%m/%Y')}</b>"]

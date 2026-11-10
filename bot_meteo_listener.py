@@ -13,6 +13,12 @@ mediante long polling y responde a comandos:
                 diario (cantidad, hora de inicio/fin e intensidad máxima)
   /mes      - Resumen de un mes escrito a mano: /mes septiembre 2026,
               /mes 9 2026, /mes 09/2026 (también /septiembre 2026)
+              Los meses anteriores a la estación muestran solo la lluvia
+  /lluvia   - Serie de lluvia desde 1993: /lluvia, /lluvia 2000,
+              /lluvia 2000-01 (año hidrológico), /lluvia marzo 2000,
+              /lluvia 15/03/2000, /lluvia ayer, /lluvia top
+  /efemerides - Lluvia de un día del año en toda la serie (/efemerides 15/03)
+  /curiosidad - Un dato curioso de la serie de lluvia
   /ayuda    - Lista de comandos
 
 Usa las mismas variables de entorno que bot_meteo.py (/etc/bot-meteo.env).
@@ -22,9 +28,10 @@ Solo responde a mensajes del chat TELEGRAM_CHAT_ID.
 import os
 import sys
 import json
+import re
 import time
 import logging
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import requests
@@ -34,8 +41,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bot_meteo import (  # noqa: E402
     descargar_observaciones, calcular_resumen, _flt, _fmt,
     leer_diario, meses_con_datos, resumen_mensual, NOMBRES_MES,
-    teclado_lluvia, construir_mensaje_lluvia_mes, texto_detalle_lluvia,
+    teclado_lluvia, texto_detalle_lluvia, bloque_historia_dia,
 )
+import lluvia_historica as lh  # noqa: E402
 
 BASE_DIR = Path(__file__).resolve().parent
 RECORDS_PATH = BASE_DIR / "records.json"
@@ -152,6 +160,9 @@ def mensaje_hoy():
         lineas.append(f"☀️ Radiación máx: <b>{_fmt(r['solar_max'], ' W/m²')}</b>")
     if r["uv_max"] is not None:
         lineas.append(f"🕶 UV máx: <b>{_fmt(r['uv_max'])}</b>")
+    historia = bloque_historia_dia(r["lluvia"], date.today())
+    if historia:
+        lineas += ["", historia]
     return "\n".join(lineas)
 
 
@@ -184,6 +195,14 @@ def mensaje_records():
             f"{etiqueta}: <b>{rec['valor']} {unidad}</b>".rstrip()
             + f" ({rec['fecha']}{hora})"
         )
+    try:
+        serie = cargar_serie()
+        if serie.inicio:
+            lineas += ["", f"🌧 <b>Lluvia — serie desde {serie.inicio.year}</b>"]
+            lineas += lh.lineas_records(serie)
+            lineas.append("Más en /lluvia top")
+    except Exception as e:
+        log.warning("Error leyendo la serie de lluvia: %s", e)
     return "\n".join(lineas)
 
 
@@ -212,7 +231,7 @@ def teclado_meses(anio, meses, hay_mas_anios):
 def menu_mensual(anio=None):
     """Devuelve (texto, teclado) del menú. Sin año: lista de años
     (o directamente los meses si solo hay un año con datos)."""
-    disponibles = meses_con_datos()
+    disponibles = meses_disponibles()
     if not disponibles:
         return "Todavía no hay días registrados.", None
     if anio is None and len(disponibles) == 1:
@@ -223,6 +242,22 @@ def menu_mensual(anio=None):
         f"📅 <b>Resúmenes mensuales — {anio}</b>\nElige un mes:",
         teclado_meses(anio, disponibles[anio], len(disponibles) > 1),
     )
+
+
+def cargar_serie():
+    return lh.cargar_serie(leer_diario())
+
+
+def meses_disponibles():
+    """Meses con datos de la estación o de la serie histórica de lluvia."""
+    resultado = {a: set(m) for a, m in meses_con_datos().items()}
+    try:
+        for (a, m), p in cargar_serie().meses().items():
+            if p["con_dato"]:
+                resultado.setdefault(a, set()).add(m)
+    except Exception as e:
+        log.warning("Error leyendo la serie de lluvia: %s", e)
+    return {a: sorted(m) for a, m in sorted(resultado.items())}
 
 
 AVISO_LECTURA = "⚠️ No se pudo leer el registro (¿se está guardando ahora mismo?). Prueba en un minuto."
@@ -237,14 +272,19 @@ def enviar_resumen_mes(anio, mes):
         enviar(AVISO_LECTURA)
         return
     if not texto:
-        enviar(f"No hay datos registrados de {NOMBRES_MES[mes]} {anio}.")
+        # Mes anterior a la estación: solo hay lluvia de la serie histórica
+        try:
+            enviar(lh.mensaje_mes(cargar_serie(), anio, mes))
+        except Exception as e:
+            log.warning("Error con la lluvia histórica de %02d/%d: %s", mes, anio, e)
+            enviar(f"No hay datos registrados de {NOMBRES_MES[mes]} {anio}.")
         return
     enviar(texto, teclado_lluvia(anio, mes))
 
 
 def enviar_lluvia_mes(anio, mes):
     try:
-        enviar(construir_mensaje_lluvia_mes(anio, mes))
+        enviar(lh.mensaje_mes(cargar_serie(), anio, mes))
     except Exception as e:
         log.warning("Error calculando la lluvia de %02d/%d: %s", mes, anio, e)
         enviar(AVISO_LECTURA)
@@ -275,13 +315,131 @@ def interpretar_mes(args):
     return anio, mes
 
 
+RE_FECHA = re.compile(r"^(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{4}))?$")
+RE_HIDRO = re.compile(r"^(\d{4})[/-](\d{2}|\d{4})$")
+
+
+def _mes_por_nombre(t):
+    for i, nombre in enumerate(NOMBRES_MES):
+        if i and len(t) >= 3 and nombre.startswith(t):
+            return i
+    return None
+
+
+def interpretar_lluvia(args, hoy=None):
+    """Traduce los argumentos de /lluvia a una consulta:
+    ('general',) ('top',) ('dia', date) ('mes', a, m) ('anio', a) ('hidro', a)"""
+    hoy = hoy or date.today()
+    tokens = [t.lower() for t in args]
+    if not tokens:
+        return ("general",)
+    t0 = tokens[0]
+    if t0 in ("top", "ranking", "rankings", "records", "récords", "record", "récord"):
+        return ("top",)
+    if t0 == "hoy":
+        return ("dia", hoy)
+    if t0 == "ayer":
+        return ("dia", hoy - timedelta(days=1))
+    if t0.startswith("hidro"):
+        if len(tokens) > 1 and tokens[1].isdigit():
+            return ("hidro", int(tokens[1]))
+        return ("hidro", lh.inicio_hidro(hoy).year)
+    if len(tokens) == 1:
+        m = RE_FECHA.match(t0)
+        if m and m.group(3):
+            try:
+                return ("dia", date(int(m.group(3)), int(m.group(2)), int(m.group(1))))
+            except ValueError:
+                return None
+        m = RE_HIDRO.match(t0)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if b == a + 1 or b == (a + 1) % 100:
+                return ("hidro", a)
+        if t0.isdigit() and len(t0) == 4:
+            return ("anio", int(t0))
+    # "15 marzo 2000"
+    if len(tokens) == 3 and tokens[0].isdigit() and tokens[2].isdigit():
+        mes = _mes_por_nombre(tokens[1])
+        if mes:
+            try:
+                return ("dia", date(int(tokens[2]), mes, int(tokens[0])))
+            except ValueError:
+                return None
+    objetivo = interpretar_mes(args)
+    if objetivo:
+        return ("mes",) + objetivo
+    return None
+
+
+def interpretar_efemeride(args, hoy=None):
+    """'15/03', '15 marzo' o nada (hoy) -> (día, mes)."""
+    hoy = hoy or date.today()
+    if not args:
+        return hoy.day, hoy.month
+    texto = " ".join(args).lower()
+    m = RE_FECHA.match(texto)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    partes = texto.split()
+    if len(partes) == 2 and partes[0].isdigit():
+        mes = _mes_por_nombre(partes[1])
+        if mes:
+            return int(partes[0]), mes
+    return None
+
+
+AYUDA_LLUVIA = (
+    "No entiendo la consulta. Ejemplos:\n"
+    "<code>/lluvia</code> — resumen y récords\n"
+    "<code>/lluvia 2000</code> — un año\n"
+    "<code>/lluvia 2000-01</code> — año hidrológico\n"
+    "<code>/lluvia marzo 2000</code> — un mes\n"
+    "<code>/lluvia 15/03/2000</code> — un día\n"
+    "<code>/lluvia top</code> — rankings"
+)
+
+
+def comando_lluvia(args):
+    consulta = interpretar_lluvia(args)
+    if not consulta:
+        enviar(AYUDA_LLUVIA)
+        return
+    serie = cargar_serie()
+    tipo = consulta[0]
+    if tipo == "general":
+        enviar(lh.mensaje_general(serie))
+    elif tipo == "top":
+        enviar(lh.mensaje_ranking(serie))
+    elif tipo == "dia":
+        enviar(lh.mensaje_dia(serie, consulta[1]))
+    elif tipo == "mes":
+        enviar(lh.mensaje_mes(serie, consulta[1], consulta[2]))
+    elif tipo == "anio":
+        enviar(*lh.mensaje_anio(serie, consulta[1]))
+    elif tipo == "hidro":
+        enviar(*lh.mensaje_hidro(serie, consulta[1]))
+
+
+def comando_curiosidad():
+    res = lh.curiosidad_aleatoria(cargar_serie())
+    enviar(f"🤓 <b>¿Sabías que…?</b>\n\n{res[1]}" if res else "No hay datos de lluvia todavía.")
+
+
 AYUDA = (
     "🤖 <b>Bot Meteo — comandos</b>\n\n"
     "/tiempo — condiciones actuales de la estación\n"
     "/hoy — extremos del día hasta ahora\n"
     "/records — récords históricos\n"
     "/mensual — menú de resúmenes mensuales (botones)\n"
-    "/mes septiembre 2026 — resumen de un mes concreto\n"
+    "/mes septiembre 2026 — resumen de un mes concreto\n\n"
+    "🌧 <b>Lluvia desde 1993</b>\n"
+    "/lluvia — resumen, récords y ejemplos\n"
+    "/lluvia 2000 · /lluvia 2000-01 (hidrológico)\n"
+    "/lluvia marzo 2000 · /lluvia 15/03/2000 · /lluvia ayer\n"
+    "/lluvia top — rankings de días, meses y años\n"
+    "/efemerides — tal día como hoy (o /efemerides 15/03)\n"
+    "/curiosidad — un dato curioso\n\n"
     "/ayuda — este mensaje"
 )
 
@@ -321,6 +479,9 @@ def registrar_comandos():
         {"command": "hoy", "description": "Extremos del día hasta ahora"},
         {"command": "mensual", "description": "Resúmenes mensuales (menú)"},
         {"command": "mes", "description": "Resumen de un mes: /mes septiembre 2026"},
+        {"command": "lluvia", "description": "Lluvia desde 1993: /lluvia 2000, /lluvia marzo 2000"},
+        {"command": "efemerides", "description": "Tal día como hoy (lluvia)"},
+        {"command": "curiosidad", "description": "Un dato curioso de la lluvia"},
         {"command": "records", "description": "Récords históricos"},
         {"command": "ayuda", "description": "Lista de comandos"},
     ]})
@@ -346,7 +507,7 @@ def procesar_callback(cq):
             _, anio, mes = datos.split(":")
             # El resumen va en un mensaje nuevo; el menú queda para seguir consultando
             enviar_resumen_mes(int(anio), int(mes))
-        elif datos.startswith("l:"):
+        elif datos.startswith("l:") or datos.startswith("lm:"):
             _, anio, mes = datos.split(":")
             enviar_lluvia_mes(int(anio), int(mes))
     except Exception as e:
@@ -383,6 +544,17 @@ def procesar_comando(texto):
                    "<code>/mes 9 2026</code>, <code>/mes 09/2026</code> — o usa /mensual.")
             return
         enviar_resumen_mes(*objetivo)
+    elif cmd == "/lluvia":
+        comando_lluvia(args)
+    elif cmd in ("/efemerides", "/efemérides", "/efemeride", "/taldia"):
+        objetivo = interpretar_efemeride(args)
+        if not objetivo:
+            enviar("Ejemplos: <code>/efemerides</code> (hoy), <code>/efemerides 15/03</code>, "
+                   "<code>/efemerides 15 marzo</code>")
+            return
+        enviar(lh.mensaje_efemerides(cargar_serie(), *objetivo))
+    elif cmd == "/curiosidad":
+        comando_curiosidad()
     elif cmd in ("/ayuda", "/help", "/start"):
         enviar(AYUDA)
 

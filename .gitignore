@@ -3,3 +3,4 @@ __pycache__/
 venv/
 *.log
 snapshot_2100.json
+curiosidades_enviadas.json
