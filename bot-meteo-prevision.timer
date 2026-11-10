@@ -1,0 +1,9 @@
+[Unit]
+Description=Prevision de manana a las 12:00 (hora de Madrid)
+
+[Timer]
+OnCalendar=*-*-* 12:00:00 Europe/Madrid
+Persistent=true
+
+[Install]
+WantedBy=timers.target

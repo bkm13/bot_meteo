@@ -1,0 +1,10 @@
+[Unit]
+Description=Vigilancia de presion cada 15 minutos
+
+[Timer]
+OnCalendar=*:0/15
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

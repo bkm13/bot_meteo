@@ -1,5 +1,5 @@
 [Unit]
-Description=Bot Meteo - listener de comandos Telegram (/tiempo, /hoy, /records, /mensual, /mes, /lluvia)
+Description=Bot Meteo - listener de comandos Telegram (/tiempo, /hoy, /records, /mensual, /mes, /lluvia, /manana)
 After=network-online.target
 Wants=network-online.target
 

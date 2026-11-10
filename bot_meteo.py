@@ -915,6 +915,7 @@ def subir_a_github(hoy, mensaje=None):
     archivos = [
         "registro_meteo.xlsx", "registro_diario.csv", "records.csv", "records.json",
         "medias_mensuales.xlsx", "medias_mensuales.csv", "lluvia_historica.csv",
+        "predicciones.csv",
     ]
     existentes = [a for a in archivos if (BASE_DIR / a).exists()]
     mensaje = mensaje or f"Registro diario {hoy.strftime('%d/%m/%Y')}"

@@ -4,3 +4,5 @@ venv/
 *.log
 snapshot_2100.json
 curiosidades_enviadas.json
+presion_historial.json
+alerta_presion.json

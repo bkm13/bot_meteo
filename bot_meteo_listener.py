@@ -19,6 +19,9 @@ mediante long polling y responde a comandos:
               /lluvia 15/03/2000, /lluvia ayer, /lluvia top
   /efemerides - Lluvia de un día del año en toda la serie (/efemerides 15/03)
   /curiosidad - Un dato curioso de la serie de lluvia
+  /manana   - Previsión de mañana corregida con la estación (prediccion.py)
+  /barometro - Presión, tendencia en 3 h y pronóstico Zambretti
+  /aciertos - Qué tal acierta la previsión comparada con la estación
   /ayuda    - Lista de comandos
 
 Usa las mismas variables de entorno que bot_meteo.py (/etc/bot-meteo.env).
@@ -44,6 +47,7 @@ from bot_meteo import (  # noqa: E402
     teclado_lluvia, texto_detalle_lluvia, bloque_historia_dia,
 )
 import lluvia_historica as lh  # noqa: E402
+import prediccion  # noqa: E402
 
 BASE_DIR = Path(__file__).resolve().parent
 RECORDS_PATH = BASE_DIR / "records.json"
@@ -440,6 +444,10 @@ AYUDA = (
     "/lluvia top — rankings de días, meses y años\n"
     "/efemerides — tal día como hoy (o /efemerides 15/03)\n"
     "/curiosidad — un dato curioso\n\n"
+    "🔮 <b>Previsión</b>\n"
+    "/manana — previsión de mañana ajustada a tu estación\n"
+    "/barometro — presión, tendencia y pronóstico de barómetro\n"
+    "/aciertos — cómo acierta la previsión\n\n"
     "/ayuda — este mensaje"
 )
 
@@ -482,6 +490,9 @@ def registrar_comandos():
         {"command": "lluvia", "description": "Lluvia desde 1993: /lluvia 2000, /lluvia marzo 2000"},
         {"command": "efemerides", "description": "Tal día como hoy (lluvia)"},
         {"command": "curiosidad", "description": "Un dato curioso de la lluvia"},
+        {"command": "manana", "description": "Previsión de mañana ajustada a la estación"},
+        {"command": "barometro", "description": "Presión, tendencia y pronóstico de barómetro"},
+        {"command": "aciertos", "description": "Cómo acierta la previsión"},
         {"command": "records", "description": "Récords históricos"},
         {"command": "ayuda", "description": "Lista de comandos"},
     ]})
@@ -555,6 +566,13 @@ def procesar_comando(texto):
         enviar(lh.mensaje_efemerides(cargar_serie(), *objetivo))
     elif cmd == "/curiosidad":
         comando_curiosidad()
+    elif cmd in ("/manana", "/mañana", "/prevision", "/previsión"):
+        texto = prediccion.mensaje_prevision()
+        enviar(texto or "⚠️ No se pudo obtener la previsión (Open-Meteo no responde).")
+    elif cmd in ("/barometro", "/barómetro"):
+        enviar(prediccion.mensaje_barometro())
+    elif cmd == "/aciertos":
+        enviar(prediccion.mensaje_aciertos())
     elif cmd in ("/ayuda", "/help", "/start"):
         enviar(AYUDA)
 
