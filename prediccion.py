@@ -193,11 +193,25 @@ def franjas_lluvia(datos, fecha):
             lluviosas.append(int(t[11:13]))
     tramos = []
     for hora in lluviosas:
-        if tramos and hora == tramos[-1][1] + 1:
+        if tramos and hora <= tramos[-1][1] + 2:  # une huecos de una hora
             tramos[-1][1] = hora
         else:
             tramos.append([hora, hora])
     return [(a, b + 1) for a, b in tramos]
+
+
+def texto_franjas(franjas):
+    partes = []
+    for a, b in franjas:
+        if a == 0 and b == 24:
+            partes.append("todo el día")
+        elif b == 24:
+            partes.append(f"desde las {a} h")
+        else:
+            partes.append(f"de {a} a {b} h")
+    if len(partes) > 1:
+        return ", ".join(partes[:-1]) + " y " + partes[-1]
+    return partes[0] if partes else ""
 
 
 def lluvia_proximas_horas(datos, ahora, horas=6):
@@ -286,14 +300,21 @@ def guardar_prediccion(p, corr):
     escribir_predicciones(preds)
 
 
-def evaluar(dias_diario=None, ultimos=DIAS_CORRECCION, hasta=None):
+def es_lluvioso(pred):
+    """Día de lluvia según lo que dijo el modelo (lo único que se sabe al prever)."""
+    return (pred.get("lluvia") or 0) >= 1
+
+
+def evaluar(dias_diario=None, ultimos=DIAS_CORRECCION, hasta=None, filtro=None):
     """Compara previsiones guardadas con lo medido.
-    Devuelve dict con sesgo y errores de tmax/tmin y aciertos de lluvia."""
+    Devuelve dict con sesgo y errores de tmax/tmin, factor de rachas y
+    aciertos de lluvia. 'filtro' elige solo días parecidos (p. ej. lluviosos)."""
     dias_diario = leer_diario() if dias_diario is None else dias_diario
     medido = {d["fecha"]: d for d in dias_diario}
     preds = leer_predicciones()
     hasta = hasta or hoy_madrid()
-    fechas = sorted(f for f in preds if f in medido and f < hasta)
+    fechas = sorted(f for f in preds if f in medido and f < hasta
+                    and (filtro is None or filtro(preds[f])))
     fechas = fechas[-ultimos:] if ultimos else fechas
     res = {"n": len(fechas), "desde": fechas[0] if fechas else None}
     for clave in ("tmax", "tmin"):
@@ -309,6 +330,11 @@ def evaluar(dias_diario=None, ultimos=DIAS_CORRECCION, hasta=None):
                 # error que habría tenido aplicando la corrección media
                 "error_corregido": sum(abs(e - sesgo) for e in errores) / len(errores),
             }
+    rachas = [(medido[f]["racha"], preds[f]["racha"]) for f in fechas
+              if medido[f].get("racha") and preds[f].get("racha")]
+    if rachas:
+        res["racha"] = {"n": len(rachas),
+                        "factor": sum(m for m, _ in rachas) / sum(p for _, p in rachas)}
     lluvia = [(preds[f].get("lluvia") or 0, medido[f].get("lluvia") or 0) for f in fechas]
     if lluvia:
         dijo = [p >= 1 for p, _ in lluvia]
@@ -323,14 +349,37 @@ def evaluar(dias_diario=None, ultimos=DIAS_CORRECCION, hasta=None):
     return res
 
 
-def corregir(p, ev):
+def evaluar_parecidos(p, dias_diario=None):
+    """Evaluación con los días que más se parecen al previsto: si el modelo
+    da lluvia, solo días de lluvia (nubes y viento: casi no hay inversión
+    nocturna); si no, los días secos de los últimos 30. Si no hay bastantes
+    días parecidos, se usan todos y en días de lluvia la corrección se reduce
+    a la mitad. Devuelve (evaluación, descripción, factor)."""
+    lluvioso = es_lluvioso(p)
+    if lluvioso:
+        ev = evaluar(dias_diario, ultimos=None, filtro=es_lluvioso)
+        desc = "días de lluvia"
+    else:
+        ev = evaluar(dias_diario, filtro=lambda r: not es_lluvioso(r))
+        desc = "días secos"
+    if all((ev.get(c) or {}).get("n", 0) >= MIN_DIAS_CORRECCION for c in ("tmax", "tmin")):
+        return ev, desc, 1.0
+    return evaluar(dias_diario), "todos los días", 0.5 if lluvioso else 1.0
+
+
+def corregir(p, ev, factor=1.0):
     """Aplica la corrección media si hay bastantes días evaluados."""
-    corr = {"tmax": p["tmax"], "tmin": p["tmin"], "aplicada": False}
+    corr = {"tmax": p["tmax"], "tmin": p["tmin"], "racha": p.get("racha"),
+            "aplicada": False, "racha_corr": False}
     for clave in ("tmax", "tmin"):
         e = ev.get(clave)
         if e and e["n"] >= MIN_DIAS_CORRECCION and p[clave] is not None:
-            corr[clave] = p[clave] + e["sesgo"]
+            corr[clave] = p[clave] + e["sesgo"] * factor
             corr["aplicada"] = True
+    e = ev.get("racha")
+    if e and e["n"] >= MIN_DIAS_CORRECCION and p.get("racha") is not None:
+        corr["racha"] = p["racha"] * e["factor"]
+        corr["racha_corr"] = True
     return corr
 
 
@@ -346,18 +395,23 @@ def calibrar_historico(dias_diario=None):
     datos = _get_json(OM_PREV_URL, {
         "latitude": LAT, "longitude": LON, "timezone": "Europe/Madrid",
         "start_date": inicio.isoformat(), "end_date": fin.isoformat(),
-        "hourly": "temperature_2m_previous_day1,precipitation_previous_day1",
+        "hourly": "temperature_2m_previous_day1,precipitation_previous_day1,"
+                  "wind_gusts_10m_previous_day1",
     })
     h = (datos or {}).get("hourly") or {}
     tiempos = h.get("time") or []
     temps = h.get("temperature_2m_previous_day1") or []
     lluvias = h.get("precipitation_previous_day1") or []
+    rachas = h.get("wind_gusts_10m_previous_day1") or []
     por_dia = {}
     for k, t in enumerate(tiempos):
         f = date.fromisoformat(t[:10])
         tv = _flt(temps[k]) if k < len(temps) else None
         lv = _flt(lluvias[k]) if k < len(lluvias) else None
-        dia = por_dia.setdefault(f, {"t": [], "ll": 0.0, "n_ll": 0})
+        dia = por_dia.setdefault(f, {"t": [], "ll": 0.0, "n_ll": 0, "r": []})
+        rv = _flt(rachas[k]) if k < len(rachas) else None
+        if rv is not None:
+            dia["r"].append(rv)
         if tv is not None:
             dia["t"].append(tv)
         if lv is not None:
@@ -366,19 +420,26 @@ def calibrar_historico(dias_diario=None):
     preds = leer_predicciones()
     nuevos = 0
     for f, dia in por_dia.items():
-        if f in preds or len(dia["t"]) < 20:
+        racha = max(dia["r"]) if len(dia["r"]) >= 20 else None
+        if f in preds:
+            # Filas reconstruidas antes de guardar rachas: se completan
+            if preds[f].get("racha") is None and racha is not None:
+                preds[f]["racha"] = racha
+                nuevos += 1
+            continue
+        if len(dia["t"]) < 20:
             continue
         preds[f] = {
             "emitida": "reconstruida",
             "tmax": max(dia["t"]), "tmin": min(dia["t"]),
             "tmax_corr": None, "tmin_corr": None,
             "lluvia": dia["ll"] if dia["n_ll"] >= 20 else None,
-            "prob": None, "racha": None, "codigo": None,
+            "prob": None, "racha": racha, "codigo": None,
         }
         nuevos += 1
     if nuevos:
         escribir_predicciones(preds)
-    log.info("Calibración: %d días reconstruidos", nuevos)
+    log.info("Calibración: %d días reconstruidos o completados", nuevos)
     return nuevos
 
 
@@ -578,8 +639,8 @@ def mensaje_prevision(fecha=None, guardar=False, dias_diario=None):
     if not p:
         return None
     dias_diario = leer_diario() if dias_diario is None else dias_diario
-    ev = evaluar(dias_diario)
-    corr = corregir(p, ev)
+    ev, desc_ev, factor = evaluar_parecidos(p, dias_diario)
+    corr = corregir(p, ev, factor)
     if guardar:
         guardar_prediccion(p, corr)
 
@@ -592,22 +653,27 @@ def mensaje_prevision(fecha=None, guardar=False, dias_diario=None):
         for clave, nombre in (("tmax", "máx"), ("tmin", "mín")):
             e = ev.get(clave)
             if e and e["n"] >= MIN_DIAS_CORRECCION:
-                partes.append(f"{nombre} {e['sesgo']:+.1f}")
-        lineas.append(f"   <i>Ajustada a tu estación ({', '.join(partes)} °C, "
-                      f"últimos {ev['n']} días). Modelo: {_fmt1(p['tmax'])}/{_fmt1(p['tmin'])}</i>")
+                partes.append(f"{nombre} {e['sesgo'] * factor:+.1f}")
+        base = f"{ev['n']} {desc_ev}" + (", corrección a medias" if factor < 1 else "")
+        lineas.append(f"   <i>Ajustada a tu estación ({', '.join(partes)} °C según {base}). "
+                      f"Modelo: {_fmt1(p['tmax'])}/{_fmt1(p['tmin'])}</i>")
     if p["lluvia"] >= 0.1 or (p["prob"] or 0) >= 20:
         txt = f"🌧 Lluvia: <b>{p['lluvia']:.1f} L/m²</b>"
         if p["prob"] is not None:
             txt += f" · probabilidad {p['prob']:.0f}%"
         if p["franjas"]:
-            txt += " · " + ", ".join(f"de {a} a {b} h" for a, b in p["franjas"])
+            txt += " · " + texto_franjas(p["franjas"])
         lineas.append(txt)
     else:
         lineas.append("🌂 Sin lluvia prevista")
     if p["viento"] is not None:
         txt = f"💨 Viento hasta {p['viento']:.0f} km/h del {rumbo(p['dir'])}".rstrip()
         if p["racha"] is not None:
-            txt += f" · rachas {p['racha']:.0f} km/h"
+            if corr["racha_corr"]:
+                txt += (f" · rachas ≈{corr['racha']:.0f} km/h en tu estación "
+                        f"(modelo {p['racha']:.0f})")
+            else:
+                txt += f" · rachas {p['racha']:.0f} km/h"
         lineas.append(txt)
     try:
         b = lectura_barometro()
@@ -635,6 +701,10 @@ def mensaje_aciertos(dias_diario=None):
                       f"que el modelo")
         lineas.append(f"   Error medio: modelo {e['error_modelo']:.1f} °C → corregido "
                       f"{e['error_corregido']:.1f} °C")
+    r = ev.get("racha")
+    if r:
+        lineas.append(f"💨 Rachas: tu estación mide de media el <b>{r['factor'] * 100:.0f}%</b> "
+                      f"de lo que da el modelo ({r['n']} días)")
     l = ev.get("lluvia")
     if l:
         lineas.append(f"🌧 Lluvia (≥1 L/m²): acierta {l['aciertos'] * 100 // l['n']}% de los días")
@@ -739,8 +809,10 @@ def main():
     modo = sys.argv[1] if len(sys.argv) > 1 else ""
     if modo == "prevision":
         manana = hoy_madrid() + timedelta(days=1)
-        if not PRED_CSV_PATH.exists():
+        try:
             calibrar_historico()
+        except Exception as e:
+            log.warning("Calibración fallida: %s", e)
         texto = mensaje_prevision(manana, guardar=True)
         if texto:
             enviar_telegram(texto)
