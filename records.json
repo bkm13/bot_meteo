@@ -10,9 +10,9 @@
     "hora": "08:44"
   },
   "racha_max": {
-    "valor": 45.4,
-    "fecha": "2026-10-06",
-    "hora": "00:14"
+    "valor": 66.0,
+    "fecha": "2026-11-11",
+    "hora": "15:13"
   },
   "presion_max": {
     "valor": 1029.12,
@@ -20,8 +20,8 @@
     "hora": ""
   },
   "presion_min": {
-    "valor": 1005.42,
-    "fecha": "2026-11-04",
+    "valor": 995.26,
+    "fecha": "2026-11-11",
     "hora": ""
   },
   "solar_max": {
@@ -35,8 +35,8 @@
     "hora": ""
   },
   "lluvia_dia": {
-    "valor": 10.16,
-    "fecha": "2026-11-10",
+    "valor": 31.5,
+    "fecha": "2026-11-11",
     "hora": ""
   }
 }
