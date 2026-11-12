@@ -18,13 +18,15 @@ el bot sigue funcionando igual que siempre:
 Uso manual:
   python facebook.py comprobar
       Comprueba que el token funciona y cuándo caduca (no publica nada)
-  python facebook.py token APP_ID APP_SECRET TOKEN_USUARIO_CORTO
-      Convierte el token de usuario del Graph API Explorer en un token de
+  python facebook.py token
+      Pide el APP_ID, el APP_SECRET y el token del Graph API Explorer
+      (no se ven al pegarlos ni quedan en el historial) y convierte el token de usuario del Graph API Explorer en un token de
       Página que no caduca y lo imprime para pegarlo en /etc/bot-meteo.env
 """
 
 import os
 import re
+from getpass import getpass
 import sys
 import logging
 from html import unescape
@@ -134,7 +136,17 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     if len(sys.argv) >= 2 and sys.argv[1] == "comprobar":
         sys.exit(comprobar())
-    if len(sys.argv) == 5 and sys.argv[1] == "token":
-        sys.exit(token_largo(*sys.argv[2:5]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "token":
+        datos = sys.argv[2:5]
+        if len(datos) != 3:
+            print("Pega cada dato y pulsa Enter (no se verá nada al pegar, es normal)")
+            datos = [input("APP_ID: ").strip(),
+                     getpass("APP_SECRET: ").strip(),
+                     getpass("Token del Graph API Explorer (EAA...): ").strip()]
+        datos = ["".join(d.split()) for d in datos]  # quita saltos de línea pegados
+        if not all(datos):
+            print("Falta algún dato")
+            sys.exit(1)
+        sys.exit(token_largo(*datos))
     print(__doc__)
     sys.exit(1)
