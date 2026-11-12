@@ -128,6 +128,47 @@ def leer_historico(path=HIST_CSV_PATH):
     return valores, notas
 
 
+def _valor_csv(mm):
+    if mm is None:
+        return ""
+    mm = round(mm, 1)
+    return str(int(mm)) if mm == int(mm) else str(mm)
+
+
+def escribir_historico(valores, notas, path=HIST_CSV_PATH):
+    """Reescribe el CSV completo, ordenado por fecha (escritura atómica)."""
+    tmp = Path(path).with_suffix(".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(CABECERA_HIST)
+        for d in sorted(valores):
+            w.writerow([d.strftime("%d/%m/%Y"), _valor_csv(valores[d]), notas.get(d, "")])
+    tmp.replace(path)
+
+
+def volcar_estacion(dias_diario, path=HIST_CSV_PATH):
+    """Copia la lluvia de cada día de la estación (hoja Diario) al histórico,
+    para tener toda la serie desde 1993 en un solo archivo. Es idempotente:
+    se puede ejecutar cada noche y solo cambia lo que haya cambiado.
+    Devuelve cuántos días se han añadido o corregido."""
+    valores, notas = leer_historico(path)
+    cambios = 0
+    for d in dias_diario or []:
+        f = d.get("fecha")
+        if f is None:
+            continue
+        mm = d.get("lluvia")
+        mm = None if mm is None else round(mm, 1)
+        if f not in valores or valores[f] != mm:
+            valores[f] = mm
+            cambios += 1
+        if not notas.get(f):
+            notas[f] = "Estación"
+    if cambios:
+        escribir_historico(valores, notas, path)
+    return cambios
+
+
 def cargar_serie(dias_diario=None, path=HIST_CSV_PATH):
     """Serie completa: histórico + días de la estación (que mandan)."""
     valores, notas = leer_historico(path)

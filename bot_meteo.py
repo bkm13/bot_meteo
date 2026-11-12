@@ -4,7 +4,8 @@ Bot Meteo - Resumen diario de estación meteorológica (Weather Underground)
 ==========================================================================
 Modos de ejecución (systemd timers):
   resumen   21:00  - Mensaje informativo del día + snapshot de lluvia/viento
-  registro  23:57  - Registro definitivo del día (Excel, récords, GitHub), silencioso
+  registro  23:57  - Registro definitivo del día (Excel, récords, lluvia en
+                     lluvia_historica.csv, GitHub), silencioso
   mensual   día 1  - Medias del mes anterior en medias_mensuales.xlsx + GitHub
   curiosidad        - De vez en cuando, un dato curioso de la serie de lluvia
                       desde 1993 (curiosidad forzar = enviar siempre)
@@ -1279,6 +1280,12 @@ def main():
         # 23:57 — registro definitivo del día completo, sin despertar a nadie
         batidos = comprobar_records(resumen, hoy)
         registrar_en_excel(resumen, batidos, hoy)
+        # El histórico de lluvia desde 1993 sigue creciendo con la estación
+        try:
+            n = lh.volcar_estacion(leer_diario())
+            log.info("lluvia_historica.csv: %d días añadidos/actualizados", n)
+        except Exception as e:
+            log.warning("No se pudo actualizar lluvia_historica.csv: %s", e)
         total_mes, total_hidro = acumulados_lluvia(hoy, incluir_hoy=True)
         log.info("Lluvia mes: %s mm / año hidrológico: %s mm", total_mes, total_hidro)
 

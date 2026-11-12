@@ -12,8 +12,9 @@ entero con el contenido del archivo.
 
   - Celda vacía = sin dato · 0 = no llovió
   - Acepta decimales con coma o punto
-  - Los días desde el inicio de la estación (06/08/2026) se ignoran:
-    para esos manda la hoja Diario de registro_meteo.xlsx
+  - Los días desde el inicio de la estación (06/08/2026) se ignoran y se
+    conservan los que ya hay en el CSV: esos los rellena el bot cada noche
+    desde la hoja Diario de registro_meteo.xlsx
 """
 
 import csv
@@ -23,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lluvia_historica import (  # noqa: E402
-    HIST_CSV_PATH, CABECERA_HIST, _fecha, _num, cargar_serie,
+    HIST_CSV_PATH, _fecha, _num, cargar_serie, leer_historico, escribir_historico,
 )
 
 INICIO_ESTACION = date(2026, 8, 6)
@@ -82,13 +83,16 @@ def main():
         print("\n".join(errores[:50]))
         sys.exit(1)
 
-    with open(HIST_CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(CABECERA_HIST)
-        for d in sorted(datos):
-            mm, nota = datos[d]
-            valor = "" if mm is None else (int(mm) if mm == int(mm) else mm)
-            w.writerow([d.strftime("%d/%m/%Y"), valor, nota])
+    # Días de la estación ya volcados por el bot: se conservan tal cual
+    previos, notas_previas = leer_historico()
+    valores = {d: mm for d, (mm, _) in datos.items()}
+    notas = {d: nota for d, (_, nota) in datos.items() if nota}
+    for d, mm in previos.items():
+        if d >= INICIO_ESTACION:
+            valores[d] = mm
+            if notas_previas.get(d):
+                notas[d] = notas_previas[d]
+    escribir_historico(valores, notas)
 
     serie = cargar_serie()
     print(f"✅ {HIST_CSV_PATH.name} escrito: {len(datos)} días "
