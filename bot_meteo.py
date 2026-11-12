@@ -24,6 +24,9 @@ Variables de entorno necesarias (/etc/bot-meteo.env):
   WU_STATION_ID     - ID de la estación (ej: ICARTA12)
   TELEGRAM_TOKEN    - Token del bot de Telegram (BotFather)
   TELEGRAM_CHAT_ID  - Chat ID donde enviar los mensajes
+  FB_PAGE_ID, FB_PAGE_TOKEN - Opcionales: si están, el resumen de las 21:00
+                    y las curiosidades se publican también en la Página de
+                    Facebook (ver facebook.py)
 """
 
 import os
@@ -42,6 +45,7 @@ import requests
 from openpyxl import Workbook, load_workbook
 
 import lluvia_historica as lh
+from facebook import publicar_facebook
 
 
 # ---------------------------------------------------------------------------
@@ -1136,7 +1140,9 @@ def ejecutar_curiosidad(hoy, forzar=False):
         log.info("No hay curiosidad disponible")
         return
     clave, texto = res
-    if enviar_telegram(f"🤓 <b>¿Sabías que…?</b>\n\n{texto}"):
+    mensaje = f"🤓 <b>¿Sabías que…?</b>\n\n{texto}"
+    publicar_facebook(mensaje)
+    if enviar_telegram(mensaje):
         enviadas.append({"clave": clave, "fecha": hoy.isoformat()})
         CURIOSIDADES_PATH.write_text(json.dumps(enviadas, ensure_ascii=False, indent=1),
                                      encoding="utf-8")
@@ -1201,6 +1207,7 @@ def main():
         if historia:
             texto += "\n\n" + historia
         enviar_telegram(texto)
+        publicar_facebook(texto)
         guardar_snapshot(resumen, hoy)
     else:
         # 23:57 — registro definitivo del día completo, sin despertar a nadie
