@@ -1149,6 +1149,53 @@ def ejecutar_curiosidad(hoy, forzar=False):
 
 
 # ---------------------------------------------------------------------------
+# Prueba de Facebook (modo "prueba-facebook [dd/mm/aaaa]")
+# ---------------------------------------------------------------------------
+def resumen_desde_csv(dia):
+    """Reconstruye el dict de calcular_resumen() a partir de la fila del día
+    en registro_diario.csv (espejo de la hoja Diario)."""
+    with open(CSV_DIARIO_PATH, encoding="utf-8-sig", newline="") as f:
+        for fila in csv.DictReader(f):
+            if fila.get("Fecha") == dia.strftime("%d/%m/%Y"):
+                break
+        else:
+            return None
+    n = lambda col: _flt(fila.get(col))
+    t = lambda col: (fila.get(col) or "").strip() or None
+    return {
+        "temp_max": n("Temp Máx (°C)"), "hora_temp_max": t("Hora Temp Máx"),
+        "temp_min": n("Temp Mín (°C)"), "hora_temp_min": t("Hora Temp Mín"),
+        "racha_max": n("Racha Máx (km/h)"), "hora_racha": t("Hora Racha"),
+        "lluvia": n("Lluvia (mm)"),
+        "lluvia_ini": t("Inicio Lluvia"), "lluvia_fin": t("Fin Lluvia"),
+        "intensidad_max": n("Intensidad Máx (mm/h)"), "hora_intensidad": t("Hora Intensidad"),
+        "presion_max": n("Presión Máx (hPa)"), "presion_min": n("Presión Mín (hPa)"),
+        "humedad_max": n("Humedad Máx (%)"), "humedad_min": n("Humedad Mín (%)"),
+        "solar_max": n("Radiación Máx (W/m²)"), "hora_solar": t("Hora Radiación"),
+        "uv_max": n("UV Máx"),
+    }
+
+
+def ejecutar_prueba_facebook(dia):
+    """Publica SOLO en Facebook el resumen de un día ya registrado, tal y como
+    saldría a las 21:00, con una línea de 'prueba' arriba."""
+    resumen = resumen_desde_csv(dia)
+    if not resumen:
+        print(f"No hay datos del {dia.strftime('%d/%m/%Y')} en {CSV_DIARIO_PATH.name}")
+        return
+    total_mes, total_hidro = acumulados_lluvia(dia, incluir_hoy=True)
+    texto = construir_mensaje(resumen, [], dia, total_hidro, total_mes)
+    historia = bloque_historia_dia(resumen["lluvia"], dia)
+    if historia:
+        texto += "\n\n" + historia
+    texto = f"🧪 Publicación de prueba (resumen del {dia.strftime('%d/%m/%Y')})\n\n" + texto
+    from facebook import html_a_texto
+    print(html_a_texto(texto) + "\n")
+    post = publicar_facebook(texto)
+    print(f"Publicado en Facebook: {post}" if post else "No se pudo publicar (mira bot_meteo.log)")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -1165,6 +1212,11 @@ def main():
     # Modos: "resumen" (21:00), "registro" (23:57, silencioso), "mensual" (día 1),
     # "curiosidad" (una vez al día, a veces)
     modo = sys.argv[1] if len(sys.argv) > 1 else "resumen"
+    if modo == "prueba-facebook":
+        dia = (datetime.strptime(sys.argv[2], "%d/%m/%Y").date() if len(sys.argv) > 2
+               else date.today() - timedelta(days=1))
+        ejecutar_prueba_facebook(dia)
+        return
     if modo not in ("resumen", "registro", "mensual", "curiosidad"):
         log.error("Modo desconocido: %s (usa 'resumen', 'registro', 'mensual' o 'curiosidad')", modo)
         sys.exit(1)
