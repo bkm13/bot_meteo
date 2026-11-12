@@ -321,8 +321,9 @@ def _pct(v, media):
 # ---------------------------------------------------------------------------
 # Comparaciones (resumen de las 21:00, registro, resumen mensual)
 # ---------------------------------------------------------------------------
-def comparar_dia(serie, mm, fecha, rnd=random):
-    """Líneas de 'en la historia' para un día con 'mm' litros."""
+def comparar_dia(serie, mm, fecha, rnd=random, publico=False):
+    """Líneas de 'en la historia' para un día con 'mm' litros.
+    publico=True: frases explicadas para Facebook."""
     if mm is None or mm < 1 or not serie.conocidos:
         return []
     lineas = []
@@ -333,14 +334,29 @@ def comparar_dia(serie, mm, fecha, rnd=random):
     if iguales:
         d, v = rnd.choice(iguales)
         extra = f" (y {len(iguales) - 1} días más)" if len(iguales) > 1 else ""
-        lineas.append(f"🔁 Lo mismo que el {_f(d)}: {_mm(v)} L/m²{extra}")
+        if publico:
+            extra = (f". Ha pasado otras {len(iguales) - 1} veces más desde {serie.inicio.year}"
+                     if len(iguales) > 1 else "")
+            lineas.append(f"🔁 Ha caído exactamente lo mismo que el {_f(d)}: {_mm(v)} L/m²{extra}.")
+        else:
+            lineas.append(f"🔁 Lo mismo que el {_f(d)}: {_mm(v)} L/m²{extra}")
     elif cercanos:
         d, v = rnd.choice(cercanos)
-        lineas.append(f"🔁 Parecido al {_f(d)}: {_mm(v)} L/m² "
-                      f"({len(cercanos)} {'día parecido' if len(cercanos) == 1 else 'días parecidos'} en la serie)")
+        if publico:
+            n = len(cercanos)
+            lineas.append(f"🔁 Una lluvia parecida a la del {_f(d)}, cuando cayeron {_mm(v)} L/m². "
+                          f"Desde {serie.inicio.year} ha habido "
+                          f"{'1 día' if n == 1 else f'{n} días'} con una cantidad similar.")
+        else:
+            lineas.append(f"🔁 Parecido al {_f(d)}: {_mm(v)} L/m² "
+                          f"({len(cercanos)} {'día parecido' if len(cercanos) == 1 else 'días parecidos'} en la serie)")
     elif otros:
         d, v = min(otros, key=lambda x: abs(x[1] - mm))
-        lineas.append(f"🔁 El día más parecido de la serie: {_f(d)} con {_mm(v)} L/m²")
+        if publico:
+            lineas.append(f"🔁 El día más parecido desde {serie.inicio.year} fue el {_f(d)}, "
+                          f"con {_mm(v)} L/m².")
+        else:
+            lineas.append(f"🔁 El día más parecido de la serie: {_f(d)} con {_mm(v)} L/m²")
 
     anteriores = [(d, v) for d, v in otros if v >= mm and d < fecha]
     if not [x for x in otros if x[1] >= mm]:
@@ -348,10 +364,18 @@ def comparar_dia(serie, mm, fecha, rnd=random):
     elif anteriores:
         d, v = anteriores[-1]
         if (fecha - d).days > 60:
-            lineas.append(f"📈 No llovía tanto en un día desde el {_f(d)} ({_mm(v)} L/m²)")
+            if publico:
+                lineas.append(f"📈 Es la mayor lluvia en un solo día desde el {_f(d)}, "
+                              f"cuando cayeron {_mm(v)} L/m².")
+            else:
+                lineas.append(f"📈 No llovía tanto en un día desde el {_f(d)} ({_mm(v)} L/m²)")
     puesto = serie.ranking_dia(mm, excluir=fecha)
     if puesto <= 100:
-        lineas.append(f"🥇 Puesto {puesto} entre los días más lluviosos desde {serie.inicio.year}")
+        if publico:
+            lineas.append(f"🥇 Es el día número {puesto} con más lluvia de todos los "
+                          f"registrados desde {serie.inicio.year}.")
+        else:
+            lineas.append(f"🥇 Puesto {puesto} entre los días más lluviosos desde {serie.inicio.year}")
     return lineas
 
 
@@ -366,7 +390,7 @@ def _mes_parecido(serie, total, a, m):
     return min(completos.items(), key=lambda x: abs(x[1]["total"] - total))
 
 
-def comparar_mes(serie, total, a, m, en_curso=False):
+def comparar_mes(serie, total, a, m, en_curso=False, publico=False):
     """Compara la lluvia de un mes (terminado o en curso) con la serie."""
     lineas = []
     nombre = NOMBRES_MES[m]
@@ -382,7 +406,10 @@ def comparar_mes(serie, total, a, m, en_curso=False):
     if completos:
         superados = sum(1 for p in completos.values() if total > p["total"])
         if en_curso:
-            if superados:
+            if superados and publico:
+                lineas.append(f"📈 En lo que va de mes ya ha llovido más que en {superados} de los "
+                              f"{len(completos)} meses de {nombre} registrados desde {serie.inicio.year}.")
+            elif superados:
                 lineas.append(f"📈 Ya ha llovido más que en {superados} de los {len(completos)} "
                               f"{plural_mes(m)} registrados")
         else:
@@ -397,14 +424,28 @@ def comparar_mes(serie, total, a, m, en_curso=False):
         parecido = _mes_parecido(serie, total, a, m)
         if parecido:
             (pa, pm), p = parecido
-            lineas.append(f"🔁 Un mes parecido: {NOMBRES_MES[pm]} de {pa} con {_mm(p['total'])} L/m²")
+            if publico and en_curso:
+                lineas.append(f"🔁 Lo que llevamos de mes ya es parecido a lo que llovió en todo "
+                              f"{NOMBRES_MES[pm]} de {pa} ({_mm(p['total'])} L/m²).")
+            elif publico:
+                lineas.append(f"🔁 Un mes parecido fue {NOMBRES_MES[pm]} de {pa}, "
+                              f"con {_mm(p['total'])} L/m².")
+            else:
+                lineas.append(f"🔁 Un mes parecido: {NOMBRES_MES[pm]} de {pa} con {_mm(p['total'])} L/m²")
     return lineas
 
 
-def comparar_hidro(serie, total, fecha, corto=False):
+def comparar_hidro(serie, total, fecha, corto=False, publico=False):
     media, n = serie.media_hidro_a_fecha(fecha)
     if not media:
         return []
+    if publico:
+        pct = total / media * 100
+        estado = ("por debajo de lo normal" if pct < 90 else
+                  "por encima de lo normal" if pct > 110 else "dentro de lo normal")
+        return [f"🪣 Desde el 1 de septiembre (inicio del año hidrológico) lo normal a "
+                f"estas alturas es haber recogido unos {_mm(media)} L/m². Llevamos el "
+                f"{pct:.0f}% de esa cantidad: vamos {estado}."]
     if corto:  # cuando el total ya se ha dicho en el mismo mensaje
         return [f"🪣 A {fecha.day} de {NOMBRES_MES[fecha.month]} lo normal es llevar "
                 f"{_mm(media)} L/m² en el año hidrológico (vamos al {_pct(total, media)})"]

@@ -623,10 +623,12 @@ def linea_mes(total, hoy):
     return f"🗓 Lluvia en {NOMBRES_MES[hoy.month]}: <b>{total:.1f} L/m²</b>"
 
 
-def linea_hidro(total, hoy):
+def linea_hidro(total, hoy, publico=False):
     if total is None:
         return None
     _, etiqueta = anio_hidrologico(hoy)
+    if publico:
+        return f"🪣 Desde el 1 de septiembre: <b>{total:.1f} L/m²</b> (año hidrológico {etiqueta})"
     return f"🪣 Año hidrológico {etiqueta}: <b>{total:.1f} L/m²</b>"
 
 
@@ -1033,29 +1035,33 @@ def _fmt(valor, unidad=""):
     return f"{valor:.1f}{unidad}" if valor is not None else "n/d"
 
 
-def bloque_historia_dia(mm, hoy, con_mes=True):
+def bloque_historia_dia(mm, hoy, con_mes=True, publico=False):
     """'En la historia': comparación de la lluvia de hoy (y del mes) con la
     serie desde 1993. Solo si hoy ha llovido al menos 1 L/m²."""
     if not mm or mm < 1:
         return ""
     try:
         serie = lh.cargar_serie([d for d in leer_diario() if d["fecha"] != hoy])
-        lineas = lh.comparar_dia(serie, mm, hoy)
+        lineas = lh.comparar_dia(serie, mm, hoy, publico=publico)
         if con_mes:
             mes = serie.periodo(hoy.replace(day=1), hoy - timedelta(days=1))["total"] + mm
-            lineas += [l for l in lh.comparar_mes(serie, mes, hoy.year, hoy.month, en_curso=True)
+            lineas += [l for l in lh.comparar_mes(serie, mes, hoy.year, hoy.month, en_curso=True,
+                                                  publico=publico)
                        if not l.startswith("📊")]
             hidro = serie.periodo(lh.inicio_hidro(hoy), hoy - timedelta(days=1))["total"] + mm
-            lineas += lh.comparar_hidro(serie, hidro, hoy, corto=True)
+            lineas += lh.comparar_hidro(serie, hidro, hoy, corto=True, publico=publico)
         if not lineas:
             return ""
+        if publico:
+            return "\n\n".join([f"📜 <b>Comparado con los registros de lluvia desde "
+                                 f"{serie.inicio.year}</b>"] + lineas)
         return "\n".join([f"📜 <b>En la historia</b> (desde {serie.inicio.year})"] + lineas)
     except Exception as e:
         log.warning("No se pudo comparar con la serie histórica: %s", e)
         return ""
 
 
-def construir_mensaje(resumen, batidos, hoy, total_hidro=None, total_mes=None):
+def construir_mensaje(resumen, batidos, hoy, total_hidro=None, total_mes=None, publico=False):
     lineas = [
         f"🌦 <b>Resumen meteo — {hoy.strftime('%d/%m/%Y')}</b>",
         "",
@@ -1069,7 +1075,7 @@ def construir_mensaje(resumen, batidos, hoy, total_hidro=None, total_mes=None):
             resumen.get("intensidad_max"), resumen.get("hora_intensidad"),
         )
         lineas.append(f"🌧 Lluvia: <b>{resumen['lluvia']:.1f} mm</b>{detalle}")
-    for linea in (linea_mes(total_mes, hoy), linea_hidro(total_hidro, hoy)):
+    for linea in (linea_mes(total_mes, hoy), linea_hidro(total_hidro, hoy, publico)):
         if linea:
             lineas.append(linea)
     lineas.append(
@@ -1176,7 +1182,7 @@ def resumen_desde_csv(dia):
     }
 
 
-def ejecutar_prueba_facebook(dia):
+def ejecutar_prueba_facebook(dia, publicar=True):
     """Publica SOLO en Facebook el resumen de un día ya registrado, tal y como
     saldría a las 21:00, con una línea de 'prueba' arriba."""
     resumen = resumen_desde_csv(dia)
@@ -1184,13 +1190,16 @@ def ejecutar_prueba_facebook(dia):
         print(f"No hay datos del {dia.strftime('%d/%m/%Y')} en {CSV_DIARIO_PATH.name}")
         return
     total_mes, total_hidro = acumulados_lluvia(dia, incluir_hoy=True)
-    texto = construir_mensaje(resumen, [], dia, total_hidro, total_mes)
-    historia = bloque_historia_dia(resumen["lluvia"], dia)
+    texto = construir_mensaje(resumen, [], dia, total_hidro, total_mes, publico=True)
+    historia = bloque_historia_dia(resumen["lluvia"], dia, publico=True)
     if historia:
         texto += "\n\n" + historia
     texto = f"🧪 Publicación de prueba (resumen del {dia.strftime('%d/%m/%Y')})\n\n" + texto
     from facebook import html_a_texto
     print(html_a_texto(texto) + "\n")
+    if not publicar:
+        print("(Solo vista previa: no se ha publicado)")
+        return
     post = publicar_facebook(texto)
     print(f"Publicado en Facebook: {post}" if post else "No se pudo publicar (mira bot_meteo.log)")
 
@@ -1213,9 +1222,10 @@ def main():
     # "curiosidad" (una vez al día, a veces)
     modo = sys.argv[1] if len(sys.argv) > 1 else "resumen"
     if modo == "prueba-facebook":
-        dia = (datetime.strptime(sys.argv[2], "%d/%m/%Y").date() if len(sys.argv) > 2
+        args = [a for a in sys.argv[2:] if a != "ver"]
+        dia = (datetime.strptime(args[0], "%d/%m/%Y").date() if args
                else date.today() - timedelta(days=1))
-        ejecutar_prueba_facebook(dia)
+        ejecutar_prueba_facebook(dia, publicar="ver" not in sys.argv[2:])
         return
     if modo not in ("resumen", "registro", "mensual", "curiosidad"):
         log.error("Modo desconocido: %s (usa 'resumen', 'registro', 'mensual' o 'curiosidad')", modo)
@@ -1259,7 +1269,11 @@ def main():
         if historia:
             texto += "\n\n" + historia
         enviar_telegram(texto)
-        publicar_facebook(texto)
+        texto_fb = construir_mensaje(resumen, [], hoy, total_hidro, total_mes, publico=True)
+        historia_fb = bloque_historia_dia(resumen["lluvia"], hoy, publico=True)
+        if historia_fb:
+            texto_fb += "\n\n" + historia_fb
+        publicar_facebook(texto_fb)
         guardar_snapshot(resumen, hoy)
     else:
         # 23:57 — registro definitivo del día completo, sin despertar a nadie
