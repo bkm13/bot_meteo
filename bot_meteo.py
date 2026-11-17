@@ -61,6 +61,7 @@ MEDIAS_CSV_PATH = BASE_DIR / "medias_mensuales.csv"
 RECORDS_PATH = BASE_DIR / "records.json"
 SNAPSHOT_PATH = BASE_DIR / "snapshot_2100.json"
 CURIOSIDADES_PATH = BASE_DIR / "curiosidades_enviadas.json"
+HISTORIA_USADA_PATH = BASE_DIR / "historia_usada.json"
 # Probabilidad de enviar curiosidad cada vez que salta el timer (1 vez al día)
 CURIOSIDAD_PROB = float(os.environ.get("CURIOSIDAD_PROB", "0.5"))
 LOG_PATH = BASE_DIR / "bot_meteo.log"
@@ -618,9 +619,11 @@ def lluvia_acumulada_hidro(hoy, incluir_hoy=True):
     return acumulados_lluvia(hoy, incluir_hoy)[1]
 
 
-def linea_mes(total, hoy):
+def linea_mes(total, hoy, publico=False):
     if total is None:
         return None
+    if publico:
+        return f"🗓 Lluvia en {NOMBRES_MES[hoy.month].capitalize()}: <b>{total:.1f} L/m²</b>"
     return f"🗓 Lluvia en {NOMBRES_MES[hoy.month]}: <b>{total:.1f} L/m²</b>"
 
 
@@ -629,7 +632,7 @@ def linea_hidro(total, hoy, publico=False):
         return None
     _, etiqueta = anio_hidrologico(hoy)
     if publico:
-        return f"🪣 Desde el 1 de septiembre: <b>{total:.1f} L/m²</b> (año hidrológico {etiqueta})"
+        return f"🪣 Desde el 1 de Septiembre: <b>{total:.1f} L/m²</b> (año hidrológico {etiqueta})"
     return f"🪣 Año hidrológico {etiqueta}: <b>{total:.1f} L/m²</b>"
 
 
@@ -1036,35 +1039,72 @@ def _fmt(valor, unidad=""):
     return f"{valor:.1f}{unidad}" if valor is not None else "n/d"
 
 
-def bloque_historia_dia(mm, hoy, con_mes=True, publico=False):
-    """'En la historia': comparación de la lluvia de hoy (y del mes) con la
-    serie desde 1993. Solo si hoy ha llovido al menos 1 L/m²."""
-    if not mm or mm < 1:
-        return ""
+def _historia_usada():
     try:
-        serie = lh.cargar_serie([d for d in leer_diario() if d["fecha"] != hoy])
-        lineas = lh.comparar_dia(serie, mm, hoy, publico=publico)
-        if con_mes:
-            mes = serie.periodo(hoy.replace(day=1), hoy - timedelta(days=1))["total"] + mm
-            lineas += [l for l in lh.comparar_mes(serie, mes, hoy.year, hoy.month, en_curso=True,
-                                                  publico=publico)
-                       if not l.startswith("📊")]
-            hidro = serie.periodo(lh.inicio_hidro(hoy), hoy - timedelta(days=1))["total"] + mm
-            lineas += lh.comparar_hidro(serie, hidro, hoy, corto=True, publico=publico)
-        if not lineas:
-            return ""
-        if publico:
-            return "\n\n".join([f"📜 <b>Comparado con los registros de lluvia desde "
-                                 f"{serie.inicio.year}</b>"] + lineas)
-        return "\n".join([f"📜 <b>En la historia</b> (desde {serie.inicio.year})"] + lineas)
+        return json.loads(HISTORIA_USADA_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def lineas_historia_dia(mm, hoy, con_mes=True, registrar=False, maximo=None):
+    """Comparaciones de la lluvia de hoy con la serie desde 1993: 1 o 2 al azar
+    entre las más interesantes, sin repetir las del último día de lluvia.
+    registrar=True (resumen de las 21:00) apunta las elegidas para no
+    repetirlas la próxima vez. Devuelve (año de inicio de la serie, líneas)."""
+    if not mm or mm < 1:
+        return None, []
+    serie = lh.cargar_serie([d for d in leer_diario() if d["fecha"] != hoy])
+    cands = lh.candidatos_dia(serie, mm, hoy)
+    if con_mes:
+        mes = serie.periodo(hoy.replace(day=1), hoy - timedelta(days=1))["total"] + mm
+        cands += lh.candidatos_mes(serie, mes, hoy.year, hoy.month)
+        hidro = serie.periodo(lh.inicio_hidro(hoy), hoy - timedelta(days=1))["total"] + mm
+        cands += lh.candidatos_hidro(serie, hidro, hoy)
+    usadas = _historia_usada()
+    # Lo que salió el último día de lluvia anterior a hoy (y hoy, si ya salió algo)
+    recientes = set()
+    for u in usadas:
+        if u.get("fecha") == hoy.isoformat():
+            recientes.update(u.get("claves", []))
+    previas = [u for u in usadas if u.get("fecha", "") < hoy.isoformat()]
+    if previas:
+        recientes.update(previas[-1].get("claves", []))
+    elegidos = lh.elegir_candidatos(cands, recientes, maximo=maximo)
+    if registrar and elegidos:
+        usadas = [u for u in usadas if u.get("fecha") != hoy.isoformat()]
+        usadas.append({"fecha": hoy.isoformat(), "claves": [k for k, _, _ in elegidos]})
+        HISTORIA_USADA_PATH.write_text(json.dumps(usadas[-30:], ensure_ascii=False, indent=1),
+                                       encoding="utf-8")
+    return serie.inicio.year, [t for _, _, t in elegidos]
+
+
+def bloque_historia_dia(mm, hoy, con_mes=True, registrar=False):
+    """Bloque 'comparado con los registros' para el resumen de un día de
+    lluvia (mismo texto en Telegram y en Facebook). '' si no toca."""
+    try:
+        desde, lineas = lineas_historia_dia(mm, hoy, con_mes, registrar)
     except Exception as e:
         log.warning("No se pudo comparar con la serie histórica: %s", e)
         return ""
+    if not lineas:
+        return ""
+    return "\n\n".join([f"📜 <b>Comparado con los registros de lluvia desde {desde}</b>"]
+                       + lineas)
+
+
+DIAS_SEMANA = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
 
 
 def construir_mensaje(resumen, batidos, hoy, total_hidro=None, total_mes=None, publico=False):
+    """Resumen del día. publico=True (Facebook): fecha escrita, meses con
+    mayúscula y lluvia en L/m²."""
+    if publico:
+        titulo = (f"🌦 <b>El tiempo hoy, {DIAS_SEMANA[hoy.weekday()]} {hoy.day} de "
+                  f"{NOMBRES_MES[hoy.month].capitalize()} de {hoy.year}</b>")
+    else:
+        titulo = f"🌦 <b>Resumen meteo — {hoy.strftime('%d/%m/%Y')}</b>"
     lineas = [
-        f"🌦 <b>Resumen meteo — {hoy.strftime('%d/%m/%Y')}</b>",
+        titulo,
         "",
         f"🌡 Máxima: <b>{_fmt(resumen['temp_max'], '°C')}</b> ({resumen['hora_temp_max'] or '—'})",
         f"❄️ Mínima: <b>{_fmt(resumen['temp_min'], '°C')}</b> ({resumen['hora_temp_min'] or '—'})",
@@ -1075,22 +1115,29 @@ def construir_mensaje(resumen, batidos, hoy, total_hidro=None, total_mes=None, p
             resumen.get("lluvia_ini"), resumen.get("lluvia_fin"),
             resumen.get("intensidad_max"), resumen.get("hora_intensidad"),
         )
-        lineas.append(f"🌧 Lluvia: <b>{resumen['lluvia']:.1f} mm</b>{detalle}")
-    for linea in (linea_mes(total_mes, hoy), linea_hidro(total_hidro, hoy, publico)):
+        unidad = "L/m²" if publico else "mm"
+        lineas.append(f"🌧 Lluvia: <b>{resumen['lluvia']:.1f} {unidad}</b>{detalle}")
+    for linea in (linea_mes(total_mes, hoy, publico), linea_hidro(total_hidro, hoy, publico)):
         if linea:
             lineas.append(linea)
     lineas.append(
         f"🔵 Presión: <b>{_fmt(resumen['presion_min'])} – {_fmt(resumen['presion_max'])} hPa</b>"
     )
     if resumen["humedad_max"] is not None:
-        lineas.append(
-            f"💧 Humedad: {_fmt(resumen['humedad_min'], '%')} – {_fmt(resumen['humedad_max'], '%')}"
-        )
+        if publico:
+            lineas.append(f"💧 Humedad: {resumen['humedad_min']:.0f}% – {resumen['humedad_max']:.0f}%"
+                          if resumen["humedad_min"] is not None else
+                          f"💧 Humedad máx: {resumen['humedad_max']:.0f}%")
+        else:
+            lineas.append(
+                f"💧 Humedad: {_fmt(resumen['humedad_min'], '%')} – {_fmt(resumen['humedad_max'], '%')}"
+            )
     if resumen["solar_max"] is not None:
         hora_txt = f" ({resumen['hora_solar']})" if resumen["hora_solar"] else ""
         lineas.append(f"☀️ Radiación máx: <b>{_fmt(resumen['solar_max'], ' W/m²')}</b>{hora_txt}")
     if resumen["uv_max"] is not None:
-        lineas.append(f"🕶 UV máx: <b>{_fmt(resumen['uv_max'])}</b>")
+        uv = f"{resumen['uv_max']:.0f}" if publico else _fmt(resumen["uv_max"])
+        lineas.append(f"🕶 UV máx: <b>{uv}</b>")
 
     if batidos:
         lineas += ["", "🏆 <b>¡RÉCORD BATIDO!</b>"]
@@ -1192,7 +1239,7 @@ def ejecutar_prueba_facebook(dia, publicar=True):
         return
     total_mes, total_hidro = acumulados_lluvia(dia, incluir_hoy=True)
     texto = construir_mensaje(resumen, [], dia, total_hidro, total_mes, publico=True)
-    historia = bloque_historia_dia(resumen["lluvia"], dia, publico=True)
+    historia = bloque_historia_dia(resumen["lluvia"], dia)
     if historia:
         texto += "\n\n" + historia
     texto = f"🧪 Publicación de prueba (resumen del {dia.strftime('%d/%m/%Y')})\n\n" + texto
@@ -1266,14 +1313,13 @@ def main():
         if total_hidro is not None:
             total_hidro += hoy_mm
         texto = construir_mensaje(resumen, [], hoy, total_hidro, total_mes)
-        historia = bloque_historia_dia(resumen["lluvia"], hoy)
+        texto_fb = construir_mensaje(resumen, [], hoy, total_hidro, total_mes, publico=True)
+        # Comparación con la historia: la misma en Telegram y en Facebook
+        historia = bloque_historia_dia(resumen["lluvia"], hoy, registrar=True)
         if historia:
             texto += "\n\n" + historia
+            texto_fb += "\n\n" + historia
         enviar_telegram(texto)
-        texto_fb = construir_mensaje(resumen, [], hoy, total_hidro, total_mes, publico=True)
-        historia_fb = bloque_historia_dia(resumen["lluvia"], hoy, publico=True)
-        if historia_fb:
-            texto_fb += "\n\n" + historia_fb
         publicar_facebook(texto_fb)
         guardar_snapshot(resumen, hoy)
     else:
@@ -1294,9 +1340,11 @@ def main():
         novedades = novedades_desde_snapshot(resumen, hoy, total_hidro, total_mes)
         if novedades and any(l.startswith("🌧") for l in novedades):
             # Ha seguido lloviendo tras las 21:00: comparación con el total final
-            historia = bloque_historia_dia(resumen["lluvia"], hoy, con_mes=False)
-            if historia:
-                novedades += historia.split("\n")[1:]
+            try:
+                _, historia = lineas_historia_dia(resumen["lluvia"], hoy, con_mes=False, maximo=1)
+                novedades += historia
+            except Exception as e:
+                log.warning("No se pudo comparar con la serie histórica: %s", e)
         if novedades:
             bloques.append(
                 "\n".join([f"🌙 <b>Novedades desde las 21:00 — {hoy.strftime('%d/%m/%Y')}</b>"]

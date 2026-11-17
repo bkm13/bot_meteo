@@ -496,6 +496,209 @@ def comparar_hidro(serie, total, fecha, corto=False, publico=False):
             f"(vamos al {_pct(total, media)})"]
 
 
+# ---------------------------------------------------------------------------
+# "En la historia" de un día de lluvia: candidatos y elección aleatoria
+# ---------------------------------------------------------------------------
+# Cada día de lluvia se generan todas las comparaciones posibles, cada una con
+# una clave y un "interés" (peso). Se eligen 1 o 2 al azar, favoreciendo las
+# más llamativas y evitando las que salieron el último día de lluvia, para que
+# el mensaje no sea siempre el mismo. Los récords (peso >= RECORD) salen siempre.
+RECORD = 50
+
+
+def mes_cap(m):
+    """Nombre del mes con mayúscula inicial ('Noviembre')."""
+    return NOMBRES_MES[m].capitalize()
+
+
+def fecha_larga(d):
+    """'19 de Marzo de 2003'."""
+    return f"{d.day} de {mes_cap(d.month)} de {d.year}"
+
+
+def _litros(v):
+    return f"{_mm(v)} L/m²"
+
+
+def _veces(n):
+    return "1 vez" if n == 1 else f"{n} veces"
+
+
+def candidatos_dia(serie, mm, fecha, rnd=random):
+    """Comparaciones de la lluvia de un día con la serie: [(clave, peso, texto)]."""
+    if mm is None or mm < 1 or not serie.conocidos:
+        return []
+    c = []
+    desde = serie.inicio.year
+    otros = [(d, v) for d, v in serie.conocidos if v > 0 and d != fecha]
+    if not otros:
+        return c
+
+    # Día parecido
+    tol = max(1.0, mm * 0.1)
+    cercanos = [x for x in otros if abs(x[1] - mm) <= tol]
+    iguales = [x for x in cercanos if abs(x[1] - mm) < 0.05]
+    if iguales:
+        d, v = rnd.choice(iguales)
+        extra = (f" Ha pasado {_veces(len(iguales) - 1)} más desde {desde}."
+                 if len(iguales) > 1 else " Es la única vez desde " + str(desde) + ".")
+        c.append(("dia_igual", 4,
+                  f"🔁 Ha caído exactamente lo mismo que el {fecha_larga(d)}: {_litros(v)}.{extra}"))
+    elif cercanos:
+        d, v = rnd.choice(cercanos)
+        n = len(cercanos)
+        c.append(("dia_parecido", 4 if n <= 10 else 2,
+                  f"🔁 Ha sido una lluvia parecida a la del {fecha_larga(d)}, cuando cayeron "
+                  f"{_litros(v)}. Desde {desde} ha habido "
+                  f"{'1 día' if n == 1 else f'{n} días'} con una cantidad similar."))
+    else:
+        d, v = min(otros, key=lambda x: abs(x[1] - mm))
+        c.append(("dia_parecido", 3,
+                  f"🔁 El día más parecido desde {desde} fue el {fecha_larga(d)}, "
+                  f"con {_litros(v)}."))
+
+    # Récord o "no llovía tanto desde..."
+    anteriores = [(d, v) for d, v in otros if v >= mm and d < fecha]
+    if not [x for x in otros if x[1] >= mm]:
+        c.append(("dia_record", RECORD + 50,
+                  f"🏆 <b>¡Es el día más lluvioso registrado desde {desde}!</b>"))
+    elif anteriores:
+        d, v = anteriores[-1]
+        dias = (fecha - d).days
+        if dias > 60:
+            c.append(("dia_desde", 3 + min(dias / 365 * 2, 10),
+                      f"📈 Es la mayor lluvia en un solo día desde el {fecha_larga(d)}, "
+                      f"cuando cayeron {_litros(v)}."))
+
+    # Puesto entre los días más lluviosos
+    puesto = serie.ranking_dia(mm, excluir=fecha)
+    if 1 < puesto <= 100:
+        n_lluvia = len(otros) + 1
+        c.append(("dia_puesto", 9 if puesto <= 10 else 5 if puesto <= 30 else 2,
+                  f"🥇 Es el día número {puesto} con más lluvia de los {_miles(n_lluvia)} "
+                  f"días de lluvia registrados desde {desde}."))
+
+    # Tal día como hoy en años anteriores
+    mismos = []
+    for a in range(desde, fecha.year):
+        try:
+            v = serie.get(date(a, fecha.month, fecha.day))
+        except ValueError:
+            continue
+        if v is not None:
+            mismos.append((a, v))
+    con_lluvia = [(a, v) for a, v in mismos if v >= 1]
+    if len(mismos) >= 10:
+        dia_txt = f"{fecha.day} de {mes_cap(fecha.month)}"
+        if not con_lluvia:
+            c.append(("tal_dia", 6, f"📅 En los {len(mismos)} años anteriores no había llovido "
+                                    f"nunca un {dia_txt}."))
+        else:
+            a, v = max(con_lluvia, key=lambda x: x[1])
+            if mm > v:
+                txt = (f"📅 Es el {dia_txt} más lluvioso desde {desde}: el anterior máximo "
+                       f"fue en {a}, con {_litros(v)}.")
+                peso = 6
+            else:
+                txt = (f"📅 Un {dia_txt} ha llovido {_veces(len(con_lluvia))} en los "
+                       f"{len(mismos)} años anteriores. El más lluvioso fue el de {a}, "
+                       f"con {_litros(v)}.")
+                peso = 3
+            c.append(("tal_dia", peso, txt))
+
+    # Fin de una racha seca / varios días seguidos lloviendo
+    secos, d = 0, fecha - timedelta(days=1)
+    while serie.get(d) == 0:
+        secos += 1
+        d -= timedelta(days=1)
+    if secos >= 7:
+        c.append(("racha_seca", 4 + min(secos / 7, 8),
+                  f"☔ Se acaba una racha de {secos} días seguidos sin llover."))
+    seguidos, d = 1, fecha - timedelta(days=1)
+    while (serie.get(d) or 0) >= 1:
+        seguidos += 1
+        d -= timedelta(days=1)
+    if seguidos >= 3:
+        c.append(("racha_lluvia", 2 + min(seguidos, 8),
+                  f"🌧 Ya son {seguidos} días seguidos con lluvia."))
+    return c
+
+
+def candidatos_mes(serie, total, a, m):
+    """Comparaciones de lo que lleva llovido el mes en curso: [(clave, peso, texto)]."""
+    c = []
+    if total is None or total < 1:
+        return c
+    nombre = mes_cap(m)
+    desde = serie.inicio.year
+    media, n = serie.media_mes(m, excluir=(a, m))
+    if media:
+        pct = total / media * 100
+        if pct >= 100:
+            c.append(("mes_media", 4 + min((pct - 100) / 25, 6),
+                      f"📊 En lo que va de {nombre} ya ha llovido el {pct:.0f}% de lo que llueve "
+                      f"de media en todo el mes ({_litros(media)})."))
+        else:
+            c.append(("mes_media", 2,
+                      f"📊 {nombre} lleva el {pct:.0f}% de lo que llueve de media en todo "
+                      f"el mes ({_litros(media)}, media de {n} años)."))
+    completos = serie.meses_completos(m, excluir=(a, m))
+    if completos:
+        superados = sum(1 for p in completos.values() if total > p["total"])
+        if superados == len(completos):
+            c.append(("mes_record", RECORD,
+                      f"🏆 <b>¡Ya es el {nombre} más lluvioso desde {desde}!</b>"))
+        elif superados:
+            frac = superados / len(completos)
+            c.append(("mes_superados", 2 + (8 * frac if frac >= 0.5 else 0),
+                      f"📈 En lo que va de mes ya ha llovido más que en {superados} de los "
+                      f"{len(completos)} meses de {nombre} registrados desde {desde}."))
+    parecido = _mes_parecido(serie, total, a, m)
+    if parecido:
+        (pa, pm), p = parecido
+        c.append(("mes_parecido", 2,
+                  f"🔁 Lo que llevamos de mes ya se parece a lo que llovió en todo "
+                  f"{mes_cap(pm)} de {pa} ({_litros(p['total'])})."))
+    return c
+
+
+def candidatos_hidro(serie, total, fecha):
+    media, n = serie.media_hidro_a_fecha(fecha)
+    if not media or total is None:
+        return []
+    pct = total / media * 100
+    estado = ("por debajo de lo normal" if pct < 90 else
+              "por encima de lo normal" if pct > 110 else "dentro de lo normal")
+    peso = 6 if pct < 60 or pct > 140 else 3 if pct < 80 or pct > 120 else 2
+    return [("hidro", peso,
+             f"🪣 Desde el 1 de Septiembre, inicio del año hidrológico, lo normal a estas "
+             f"alturas es haber recogido unos {_litros(media)}. Llevamos {_litros(total)}, "
+             f"el {pct:.0f}% de esa cantidad: vamos {estado}.")]
+
+
+def _grupo(clave):
+    return clave.split("_")[0] if clave.split("_")[0] in ("mes", "hidro") else "dia"
+
+
+def elegir_candidatos(cands, recientes=(), rnd=random, maximo=None):
+    """Elige 1 o 2 comparaciones: los récords siempre; el resto al azar según su
+    interés, sin repetir las 'recientes' (si queda alguna otra) y como mucho
+    una por grupo (día / mes / año hidrológico)."""
+    if not cands:
+        return []
+    maximo = maximo or rnd.choice((1, 2, 2))
+    elegidos = [x for x in cands if x[1] >= RECORD]
+    resto = [x for x in cands if x[1] < RECORD and x[0] not in recientes] \
+        or [x for x in cands if x[1] < RECORD]
+    while len(elegidos) < maximo and resto:
+        grupos = {_grupo(k) for k, _, _ in elegidos}
+        pool = [x for x in resto if _grupo(x[0]) not in grupos] or resto
+        x = rnd.choices(pool, weights=[p for _, p, _ in pool])[0]
+        elegidos.append(x)
+        resto.remove(x)
+    return elegidos
+
+
 def cierre_periodo(serie, a, hidro=False):
     """Comparativa al terminar un año natural (dic) o hidrológico (ago)."""
     grupos = serie.hidros() if hidro else serie.anios()

@@ -121,20 +121,128 @@ def _fmt1(v, unidad=""):
 # ---------------------------------------------------------------------------
 # Open-Meteo
 # ---------------------------------------------------------------------------
-def _get_json(url, params, intentos=3):
+ULTIMO_ERROR = {"texto": ""}
+
+
+def _get_json(url, params, intentos=3, headers=None, esperas=(5, 20, 60)):
     for i in range(intentos):
         try:
-            r = requests.get(url, params=params, timeout=30)
-            r.raise_for_status()
+            r = requests.get(url, params=params, timeout=30, headers=headers)
+            if not r.ok:
+                # Open-Meteo explica el motivo en {"error": true, "reason": "..."}
+                try:
+                    motivo = r.json().get("reason") or r.text[:200]
+                except ValueError:
+                    motivo = r.text[:200]
+                raise RuntimeError(f"HTTP {r.status_code}: {motivo}")
             return r.json()
         except Exception as e:
-            log.warning("Open-Meteo (intento %d): %s", i + 1, e)
-            time.sleep(2)
+            ULTIMO_ERROR["texto"] = f"{url.split('/')[2]} → {e}"
+            log.warning("%s (intento %d): %s", url.split("/")[2], i + 1, e)
+            if i < intentos - 1:
+                time.sleep(esperas[min(i, len(esperas) - 1)])
     return None
 
 
-def pedir_pronostico(dias=3):
-    """Pronóstico diario y horario. None si falla."""
+# ---------------------------------------------------------------------------
+# Respaldo: MET Norway (yr.no), gratis y sin clave. Se convierte al mismo
+# formato que Open-Meteo para que el resto del código no cambie.
+# ---------------------------------------------------------------------------
+MET_URL = "https://api.met.no/weatherapi/locationforecast/2.0/complete"
+MET_HEADERS = {"User-Agent": "bot-meteo/1.0 github.com/bkm13/bot_meteo"}
+MET_CODIGOS = [  # (fragmento del símbolo de MET, código WMO), del más grave al más leve
+    ("thunder", 95), ("heavysnow", 75), ("snow", 73), ("sleet", 66),
+    ("heavyrainshowers", 82), ("heavyrain", 65), ("lightrainshowers", 80),
+    ("rainshowers", 81), ("lightrain", 61), ("rain", 63), ("fog", 45),
+    ("cloudy", 3), ("partlycloudy", 2), ("fair", 1), ("clearsky", 0),
+]
+
+
+def _codigo_met(simbolo):
+    simbolo = (simbolo or "").split("_")[0]
+    if simbolo == "cloudy":
+        return 3
+    if simbolo == "partlycloudy":
+        return 2
+    for trozo, codigo in MET_CODIGOS:
+        if trozo in simbolo:
+            return codigo
+    return None
+
+
+def pedir_pronostico_met():
+    datos = _get_json(MET_URL, {"lat": round(LAT, 4), "lon": round(LON, 4)},
+                      headers=MET_HEADERS)
+    serie = ((datos or {}).get("properties") or {}).get("timeseries") or []
+    if not serie:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        madrid = ZoneInfo("Europe/Madrid")
+    except Exception:
+        madrid = None
+    horas, probs, mm, por_dia = [], [], [], {}
+    for paso in serie:
+        t = datetime.strptime(paso["time"], "%Y-%m-%dT%H:%M:%SZ")
+        if madrid:
+            from datetime import timezone
+            t = t.replace(tzinfo=timezone.utc).astimezone(madrid).replace(tzinfo=None)
+        inst = (paso.get("data", {}).get("instant") or {}).get("details") or {}
+        h1 = paso.get("data", {}).get("next_1_hours")
+        if not h1:  # solo se usan los pasos horarios (las primeras ~60 h)
+            continue
+        det1 = h1.get("details") or {}
+        horas.append(t.strftime("%Y-%m-%dT%H:00"))
+        probs.append(det1.get("probability_of_precipitation"))
+        mm.append(det1.get("precipitation_amount"))
+        d = por_dia.setdefault(t.date().isoformat(), {"t": [], "ll": 0.0, "p": [], "v": [],
+                                                      "r": [], "dir": [], "cod": []})
+        if inst.get("air_temperature") is not None:
+            d["t"].append(inst["air_temperature"])
+        d["ll"] += det1.get("precipitation_amount") or 0.0
+        if det1.get("probability_of_precipitation") is not None:
+            d["p"].append(det1["probability_of_precipitation"])
+        if inst.get("wind_speed") is not None:
+            d["v"].append(inst["wind_speed"] * 3.6)
+            d["dir"].append((inst["wind_speed"], inst.get("wind_from_direction")))
+        if inst.get("wind_speed_of_gust") is not None:
+            d["r"].append(inst["wind_speed_of_gust"] * 3.6)
+        cod = _codigo_met((h1.get("summary") or {}).get("symbol_code"))
+        if cod is not None:
+            d["cod"].append(cod)
+    fechas = [f for f, d in sorted(por_dia.items()) if len(d["t"]) >= 20]
+    if not fechas:
+        return None
+    dias = [por_dia[f] for f in fechas]
+    return {
+        "fuente": "MET Norway",
+        "daily": {
+            "time": fechas,
+            "weather_code": [max(d["cod"]) if d["cod"] else None for d in dias],
+            "temperature_2m_max": [max(d["t"]) for d in dias],
+            "temperature_2m_min": [min(d["t"]) for d in dias],
+            "precipitation_sum": [round(d["ll"], 1) for d in dias],
+            "precipitation_probability_max": [max(d["p"]) if d["p"] else None for d in dias],
+            "wind_speed_10m_max": [max(d["v"]) if d["v"] else None for d in dias],
+            "wind_gusts_10m_max": [max(d["r"]) if d["r"] else None for d in dias],
+            "wind_direction_10m_dominant": [
+                max(d["dir"], key=lambda x: x[0])[1] if d["dir"] else None for d in dias],
+        },
+        "hourly": {"time": horas, "precipitation_probability": probs, "precipitation": mm},
+    }
+
+
+def pedir_pronostico(dias=3, respaldo=True):
+    """Pronóstico diario y horario (Open-Meteo; si falla, MET Norway). None si
+    fallan los dos."""
+    datos = _pedir_open_meteo(dias)
+    if datos is None and respaldo:
+        log.warning("Open-Meteo no responde: se usa MET Norway")
+        datos = pedir_pronostico_met()
+    return datos
+
+
+def _pedir_open_meteo(dias=3):
     return _get_json(OM_URL, {
         "latitude": LAT, "longitude": LON, "timezone": "Europe/Madrid",
         "forecast_days": dias,
@@ -637,11 +745,14 @@ def mensaje_prevision(fecha=None, guardar=False, dias_diario=None):
     datos = pedir_pronostico()
     p = pronostico_dia(datos, fecha)
     if not p:
+        if datos:
+            ULTIMO_ERROR["texto"] = f"el pronóstico no trae datos del {fecha.strftime('%d/%m')}"
         return None
+    respaldo = datos.get("fuente")
     dias_diario = leer_diario() if dias_diario is None else dias_diario
     ev, desc_ev, factor = evaluar_parecidos(p, dias_diario)
     corr = corregir(p, ev, factor)
-    if guardar:
+    if guardar and not respaldo:  # la corrección se calcula con Open-Meteo
         guardar_prediccion(p, corr)
 
     emoji, desc = CODIGOS_TIEMPO.get(p["codigo"], ("🌡", "—"))
@@ -681,6 +792,8 @@ def mensaje_prevision(fecha=None, guardar=False, dias_diario=None):
             lineas += ["", linea_barometro(b)]
     except Exception as e:
         log.warning("Barómetro no disponible: %s", e)
+    if respaldo:
+        lineas += ["", f"<i>Fuente: {respaldo} (Open-Meteo no respondía)</i>"]
     return "\n".join(lineas)
 
 
@@ -813,11 +926,23 @@ def main():
             calibrar_historico()
         except Exception as e:
             log.warning("Calibración fallida: %s", e)
-        texto = mensaje_prevision(manana, guardar=True)
+        texto = None
+        for intento in range(3):  # si fallan las dos fuentes, otra vez a los 10 y 20 min
+            try:
+                texto = mensaje_prevision(manana, guardar=True)
+            except Exception as e:
+                log.exception("Error preparando la previsión")
+                ULTIMO_ERROR["texto"] = str(e)
+            if texto or intento == 2:
+                break
+            log.warning("Previsión no disponible, reintento en 10 min")
+            time.sleep(600)
         if texto:
             enviar_telegram(texto)
         else:
-            enviar_telegram("⚠️ <b>Bot Meteo</b>: no se pudo obtener la previsión de mañana.",
+            motivo = ULTIMO_ERROR["texto"] or "sin datos para mañana"
+            enviar_telegram("⚠️ <b>Bot Meteo</b>: no se pudo obtener la previsión de mañana.\n"
+                            f"<code>{motivo[:300].replace('<', '‹').replace('>', '›')}</code>",
                             silencioso=True)
     elif modo == "vigilancia":
         ejecutar_vigilancia()
