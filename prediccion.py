@@ -7,6 +7,8 @@ Modos (systemd timers):
                            que mide la estación + lectura del barómetro
   vigilancia  cada 15 min - Guarda la presión; si baja deprisa avisa de que
                            puede llover pronto, a cualquier hora
+  verificacion 21:05     - Compara la previsión de hoy (la que se mandó ayer a
+                           las 12:00) con lo que ha medido la estación
   calibrar    a mano     - Reconstruye las previsiones pasadas (desde que hay
                            estación) para calcular la corrección desde el día 1
 
@@ -44,6 +46,7 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bot_meteo import (  # noqa: E402
     leer_diario, enviar_telegram, _flt, _leer_wu,
+    descargar_observaciones, calcular_resumen,
     WU_API_KEY, WU_STATION_ID, NOMBRES_MES,
 )
 
@@ -51,6 +54,9 @@ BASE_DIR = Path(__file__).resolve().parent
 PRED_CSV_PATH = BASE_DIR / "predicciones.csv"
 PRESION_PATH = BASE_DIR / "presion_historial.json"
 ALERTA_PATH = BASE_DIR / "alerta_presion.json"
+# Lo que se mandó a las 12:00 (incluida la corrección y la fuente de respaldo)
+ENVIADA_PATH = BASE_DIR / "prevision_enviada.json"
+VERIF_CSV_PATH = BASE_DIR / "verificaciones.csv"
 
 LAT = float(os.environ.get("PRED_LAT", "36.9983046"))
 LON = float(os.environ.get("PRED_LON", "-5.5739743"))
@@ -754,6 +760,8 @@ def mensaje_prevision(fecha=None, guardar=False, dias_diario=None):
     corr = corregir(p, ev, factor)
     if guardar and not respaldo:  # la corrección se calcula con Open-Meteo
         guardar_prediccion(p, corr)
+    if guardar:
+        guardar_enviada(p, corr, respaldo)
 
     emoji, desc = CODIGOS_TIEMPO.get(p["codigo"], ("🌡", "—"))
     lineas = [f"🔮 <b>Previsión para mañana — {DIAS_SEMANA[fecha.weekday()]} "
@@ -827,6 +835,208 @@ def mensaje_aciertos(dias_diario=None):
     if ev30.get("tmax") and ev30["n"] < ev["n"]:
         lineas += ["", f"Corrección actual (últimos {ev30['n']} días): máx "
                        f"{ev30['tmax']['sesgo']:+.1f} °C · mín {ev30.get('tmin', {}).get('sesgo', 0):+.1f} °C"]
+    return "\n".join(lineas)
+
+
+# ---------------------------------------------------------------------------
+# Verificación de la previsión (modo "verificacion", 21:05)
+# ---------------------------------------------------------------------------
+CABECERA_VERIF = [
+    "Fecha", "Emitida", "Fuente",
+    "Tmax prevista (°C)", "Tmin prevista (°C)", "Lluvia prevista (mm)", "Prob lluvia (%)",
+    "Tmax medida 21:05 (°C)", "Tmin medida 21:05 (°C)", "Lluvia medida 21:05 (mm)",
+]
+UMBRAL_ACIERTO = 1.0   # °C: dentro de ±1 °C es acierto
+UMBRAL_CASI = 2.0      # °C: hasta ±2 °C es "casi"
+
+
+def guardar_enviada(p, corr, fuente=None):
+    """Guarda la previsión tal y como se le dio al usuario (valores
+    corregidos si se aplicó la corrección), para verificarla al día siguiente."""
+    datos = {
+        "fecha": p["fecha"].isoformat(),
+        "emitida": ahora_madrid().strftime("%d/%m/%Y %H:%M"),
+        "fuente": fuente or "Open-Meteo",
+        "tmax": corr["tmax"], "tmin": corr["tmin"],
+        "lluvia": p.get("lluvia"), "prob": p.get("prob"),
+    }
+    try:
+        ENVIADA_PATH.write_text(json.dumps(datos, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        log.warning("No se pudo guardar la previsión enviada: %s", e)
+
+
+def prevision_de(fecha):
+    """La previsión que se dio para 'fecha': primero la guardada al enviarla;
+    si no está, la fila de predicciones.csv (corregida si la hay)."""
+    try:
+        d = json.loads(ENVIADA_PATH.read_text(encoding="utf-8"))
+        if d.get("fecha") == fecha.isoformat():
+            return d
+    except Exception:
+        pass
+    r = leer_predicciones().get(fecha)
+    if not r or r.get("emitida") == "reconstruida":
+        return None
+    return {
+        "fecha": fecha.isoformat(), "emitida": r["emitida"], "fuente": "Open-Meteo",
+        "tmax": r["tmax_corr"] if r.get("tmax_corr") is not None else r["tmax"],
+        "tmin": r["tmin_corr"] if r.get("tmin_corr") is not None else r["tmin"],
+        "lluvia": r.get("lluvia"), "prob": r.get("prob"),
+    }
+
+
+def leer_verificaciones():
+    res = {}
+    if not VERIF_CSV_PATH.exists():
+        return res
+    with open(VERIF_CSV_PATH, newline="", encoding="utf-8-sig") as f:
+        for fila in csv.DictReader(f):
+            try:
+                res[datetime.strptime(fila["Fecha"], "%d/%m/%Y").date()] = fila
+            except (KeyError, ValueError):
+                continue
+    return res
+
+
+def guardar_verificacion(fecha, prev, real):
+    filas = leer_verificaciones()
+    filas[fecha] = dict(zip(CABECERA_VERIF, [
+        fecha.strftime("%d/%m/%Y"), prev.get("emitida", ""), prev.get("fuente", ""),
+        _r(prev.get("tmax")), _r(prev.get("tmin")), _r(prev.get("lluvia")), _r(prev.get("prob")),
+        _r(real.get("temp_max")), _r(real.get("temp_min")), _r(real.get("lluvia")),
+    ]))
+    with open(VERIF_CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=CABECERA_VERIF)
+        w.writeheader()
+        for k in sorted(filas):
+            w.writerow({c: filas[k].get(c, "") for c in CABECERA_VERIF})
+
+
+def dijo_lluvia(prev):
+    """Se dio el día por lluvioso: ≥1 L/m² o probabilidad ≥50%."""
+    return (prev.get("lluvia") or 0) >= 1 or (prev.get("prob") or 0) >= 50
+
+
+def nota_temp(diferencia):
+    a = abs(diferencia)
+    if a <= UMBRAL_ACIERTO:
+        return "✅"
+    return "🟡" if a <= UMBRAL_CASI else "❌"
+
+
+def linea_temp(emoji, nombre, previsto, real):
+    if previsto is None or real is None:
+        return None, None
+    d = real - previsto
+    if abs(d) < 0.05:
+        dif = "clavada"
+    else:
+        dif = f"{abs(d):.1f} °C {'más' if d > 0 else 'menos'} de lo previsto"
+    return (f"{emoji} {nombre}: prevista <b>{previsto:.1f} °C</b> → medida <b>{real:.1f} °C</b> "
+            f"{nota_temp(d)}\n   <i>{dif}</i>"), abs(d) <= UMBRAL_ACIERTO
+
+
+def linea_lluvia(prev, real_mm):
+    mm_prev = prev.get("lluvia") or 0.0
+    prob = prev.get("prob")
+    real_mm = real_mm or 0.0
+    txt_prev = f"{mm_prev:.1f} L/m²" + (f" ({prob:.0f}%)" if prob is not None else "")
+    dijo, llovio = dijo_lluvia(prev), real_mm >= 1
+    if dijo and llovio:
+        d = real_mm - mm_prev
+        extra = ("lo previsto, clavado" if round(abs(d), 1) == 0 else
+                 f"{abs(d):.1f} L/m² {'más' if d > 0 else 'menos'} de lo previsto")
+        veredicto, ok = f"✅ Acertó: llovió ({extra})", True
+    elif not dijo and not llovio:
+        veredicto = "✅ Acertó: sin lluvia" + (f" (solo {real_mm:.1f} L/m²)" if real_mm >= 0.1 else "")
+        ok = True
+    elif dijo:
+        veredicto, ok = "❌ Falsa alarma: daba lluvia y no ha llovido" + (
+            f" (solo {real_mm:.1f} L/m²)" if real_mm >= 0.1 else ""), False
+    else:
+        veredicto, ok = "❌ No la vio venir: no daba lluvia y han caído " \
+                        f"{real_mm:.1f} L/m²", False
+    return (f"🌧 Lluvia: prevista <b>{txt_prev}</b> → medida <b>{real_mm:.1f} L/m²</b>\n"
+            f"   {veredicto}"), ok
+
+
+def balance(hasta, dias=30):
+    """Aciertos de los últimos 'dias' verificados (antes de 'hasta'), con los
+    datos definitivos del día (hoja Diario) cuando ya están."""
+    verif = leer_verificaciones()
+    medido = {d["fecha"]: d for d in leer_diario()}
+    desde = hasta - timedelta(days=dias)
+    tmax = tmin = lluvia = n = 0
+    for f, v in verif.items():
+        if not (desde <= f < hasta):
+            continue
+        m = medido.get(f, {})
+        rmax = m.get("temp_max") if m else _flt(v.get("Tmax medida 21:05 (°C)"))
+        rmin = m.get("temp_min") if m else _flt(v.get("Tmin medida 21:05 (°C)"))
+        rll = m.get("lluvia") if m else _flt(v.get("Lluvia medida 21:05 (mm)"))
+        pmax, pmin = _flt(v.get("Tmax prevista (°C)")), _flt(v.get("Tmin prevista (°C)"))
+        prev = {"lluvia": _flt(v.get("Lluvia prevista (mm)")), "prob": _flt(v.get("Prob lluvia (%)"))}
+        n += 1
+        tmax += rmax is not None and pmax is not None and abs(rmax - pmax) <= UMBRAL_ACIERTO
+        tmin += rmin is not None and pmin is not None and abs(rmin - pmin) <= UMBRAL_ACIERTO
+        lluvia += dijo_lluvia(prev) == ((rll or 0) >= 1)
+    return {"n": n, "tmax": tmax, "tmin": tmin, "lluvia": lluvia}
+
+
+def mensaje_verificacion(fecha=None, guardar=False):
+    """Compara la previsión de 'fecha' (hoy) con lo medido hasta ahora."""
+    fecha = fecha or hoy_madrid()
+    prev = prevision_de(fecha)
+    if not prev:
+        log.info("Verificación: no hay previsión guardada para %s", fecha)
+        return None
+    obs = descargar_observaciones()
+    if not obs:
+        log.warning("Verificación: sin observaciones de la estación")
+        return None
+    real = calcular_resumen(obs)
+    if guardar:
+        guardar_verificacion(fecha, prev, real)
+    hora = ahora_madrid().strftime("%H:%M")
+
+    lineas = [f"🎯 <b>¿Acertó la previsión? — {DIAS_SEMANA[fecha.weekday()]} "
+              f"{fecha.strftime('%d/%m')}</b>",
+              f"<i>Lo que dijo ayer a mediodía frente a lo medido hasta las {hora}</i>", ""]
+    aciertos, total = 0, 0
+    for emoji, nombre, clave, col in (("🌡", "Máxima", "tmax", "temp_max"),
+                                      ("❄️", "Mínima", "tmin", "temp_min")):
+        txt, ok = linea_temp(emoji, nombre, _flt(prev.get(clave)), real.get(col))
+        if txt:
+            lineas.append(txt)
+            aciertos += ok
+            total += 1
+    txt, ok = linea_lluvia(prev, real.get("lluvia"))
+    lineas.append(txt)
+    aciertos += ok
+    total += 1
+
+    avisos = []
+    ultima = (obs[-1].get("metric") or {}) if obs else {}
+    t_ahora = _flt(ultima.get("temp"))
+    if t_ahora is not None and real.get("temp_min") is not None and t_ahora - real["temp_min"] < 1.0:
+        avisos.append(f"la mínima aún puede bajar esta noche (ahora {t_ahora:.1f} °C)")
+    if (_flt(ultima.get("precipRate")) or 0) > 0:
+        avisos.append("sigue lloviendo, el total puede subir")
+    if avisos:
+        texto = "; ".join(avisos)
+        lineas += ["", "ℹ️ <i>" + texto[0].upper() + texto[1:] + "</i>"]
+
+    resumen = {3: "🏆 Pleno: 3 de 3", 2: "👍 2 de 3 aciertos", 1: "🤏 1 de 3 aciertos",
+               0: "👎 Hoy ha fallado en todo"}
+    titulo = resumen[aciertos] if total == 3 else f"{aciertos} de {total} aciertos"
+    lineas += ["", f"<b>{titulo}</b>"]
+    b = balance(fecha)
+    if b["n"] >= 3:
+        lineas.append(f"📊 Últimos {b['n']} días: máxima ±1 °C en {b['tmax']}, mínima ±1 °C en "
+                      f"{b['tmin']}, lluvia acertada en {b['lluvia']}")
+    if prev.get("fuente") and prev["fuente"] != "Open-Meteo":
+        lineas.append(f"<i>Previsión de respaldo: {prev['fuente']}</i>")
     return "\n".join(lineas)
 
 
@@ -946,13 +1156,21 @@ def main():
                             silencioso=True)
     elif modo == "vigilancia":
         ejecutar_vigilancia()
+    elif modo == "verificacion":
+        # "verificacion ver" = solo mostrar en pantalla, sin enviar ni guardar
+        solo_ver = "ver" in sys.argv[2:]
+        texto = mensaje_verificacion(guardar=not solo_ver)
+        if solo_ver:
+            print(texto or "No hay previsión guardada para hoy")
+        elif texto:
+            enviar_telegram(texto)
     elif modo == "calibrar":
         n = calibrar_historico()
         print(f"{n} días reconstruidos")
         print(mensaje_aciertos().replace("<b>", "").replace("</b>", "")
               .replace("<i>", "").replace("</i>", ""))
     else:
-        print("Uso: prediccion.py prevision | vigilancia | calibrar")
+        print("Uso: prediccion.py prevision | vigilancia | verificacion [ver] | calibrar")
         sys.exit(1)
 
 
